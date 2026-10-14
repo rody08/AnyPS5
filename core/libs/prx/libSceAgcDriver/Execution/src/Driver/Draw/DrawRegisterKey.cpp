@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
+#include "Optimization/include/Optimization/ResourceMaterializer.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -70,6 +71,10 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         key *= 0x100000001b3ull;
     };
     mix(deviceSerial);
+    mix(Graphics::MixedSampleApproximationEnabled());
+    mix(Graphics::AlphaWithoutColorEnabled());
+    mix(Graphics::TerminalMipApproximationEnabled());
+    mix(static_cast<std::uint64_t>(ShaderRecompiler::ExperimentalDepthResolveMode()));
     for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
         const auto low = queue.shader.find(base);
         const auto high = queue.shader.find(base + 1);
@@ -104,6 +109,7 @@ bool Driver::sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, co
 bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
     const auto& s = a.state;
     const auto& t = b.state;
+    if (s.samples != t.samples || s.requestedSamples != t.requestedSamples || s.mixedSampleApproximation != t.mixedSampleApproximation || s.customSampleLocations != t.customSampleLocations || s.sampleLocations != t.sampleLocations) return false;
     const auto sameColor = [](const Graphics::ColorTarget& x, const Graphics::ColorTarget& y) {
         return x.address == y.address && x.extent.width == y.extent.width && x.extent.height == y.extent.height && x.format == y.format && x.bytes == y.bytes && x.componentMapping == y.componentMapping && x.tileMode == y.tileMode && x.elementBytes == y.elementBytes && x.dccAddress == y.dccAddress && x.dccAlphaOnMsb == y.dccAlphaOnMsb && x.slot == y.slot && x.exportIndex == y.exportIndex;
     };

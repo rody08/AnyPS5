@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -20,6 +21,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <iostream>
@@ -41,6 +43,22 @@ using DepthFastClearHarness::BufferDescriptor;
 using DepthFastClearHarness::PixelCode;
 using DepthFastClearHarness::VertexCode;
 using ShaderRecompiler::ShaderStage;
+
+void SetResolvePolicy(const char* value) {
+#ifdef _WIN32
+    _putenv_s("APS5_EXPERIMENTAL_DEPTH_RESOLVE", value);
+#else
+    setenv("APS5_EXPERIMENTAL_DEPTH_RESOLVE", value, 1);
+#endif
+}
+
+void SetTerminalMips(const char* value) {
+#ifdef _WIN32
+    _putenv_s("APS5_APPROXIMATE_TERMINAL_MIPS", value);
+#else
+    setenv("APS5_APPROXIMATE_TERMINAL_MIPS", value, 1);
+#endif
+}
 
 constexpr std::uint32_t Threads = 32;
 constexpr std::uint32_t Format16Uint = 11;
@@ -87,12 +105,21 @@ alignas(256) std::array<std::uint32_t, 11> Load2D = LoadCode(LoadDims[0]);
 alignas(256) std::array<std::uint32_t, 11> LoadCube = LoadCode(LoadDims[1]);
 alignas(256) std::array<std::uint32_t, 11> LoadArray = LoadCode(LoadDims[2]);
 alignas(256) std::array<std::uint32_t, 11> LoadMultisample = LoadCode(6u);
+alignas(256) std::array<std::uint32_t, 13> Sample2D{
+    0x7e2802ffu, 0x3b800000u, 0x7e2a02ffu, 0x3b800000u, 0xf09c0108u, 0x00610314u,
+    0xbf8c3f70u, 0x34080082u, 0xe0701000u, 0x80000304u, 0xbf810000u, 0xbf810000u, 0xbf810000u
+};
+alignas(256) std::array<std::uint32_t, 7> Store2D{
+    0x7e020280u, 0x7e06020cu, 0xf0200108u, 0x00010300u, 0xbf8c3f70u, 0xbf810000u, 0xbf810000u
+};
 alignas(256) std::array<std::uint32_t, 12> LoadMultisampleArray{
     0x7e020280u, 0x7e040280u, 0x7e06020cu, 0xf0001138u, 0x00010300u, 0xbf8c3f70u,
     0x34080082u, 0xe0701000u, 0x80000304u, 0xbf810000u, 0xbf810000u, 0xbf810000u
 };
 
 alignas(256) std::array<std::byte, 256 * 128 * 4> Pixels{};
+alignas(256) std::array<std::uint32_t, 4> AlphaPixelCode{0x7e000200u, 0xf800180fu, 0u, 0xbf810000u};
+alignas(256) std::array<std::byte, 256 * 256 * 4> MixedPixels{};
 
 class GuestBlock {
 public:
@@ -148,6 +175,7 @@ struct Shape {
     std::uint32_t baseArray = 0;
     std::uint32_t samples = 1;
     std::uint64_t metadataAddress = 0;
+    std::uint32_t terminalLevel = 0;
 };
 
 std::array<std::uint32_t, 8> TextureDescriptor(const void* data, const Shape& shape) {
@@ -156,7 +184,7 @@ std::array<std::uint32_t, 8> TextureDescriptor(const void* data, const Shape& sh
         static_cast<std::uint32_t>(address >> 8u),
         static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (shape.format << 20u) | (((shape.width - 1u) & 3u) << 30u),
         ((shape.width - 1u) >> 2u) | ((shape.height - 1u) << 14u),
-        0xfacu | (shape.swizzle << 20u) | (shape.type << 28u) | (std::countr_zero(shape.samples) << 16u),
+        0xfacu | (shape.swizzle << 20u) | (shape.type << 28u) | (std::countr_zero(shape.samples) << 16u) | (shape.terminalLevel << 12u) | (shape.terminalLevel << 16u),
         shape.lastArray | (shape.baseArray << 16u),
         static_cast<std::uint32_t>(std::countr_zero(shape.samples)) << 4u,
         (shape.samples > 1 ? 1u << 10u : 0u) | (shape.metadataAddress != 0 ? 1u << 21u : 0u) | (static_cast<std::uint32_t>((shape.metadataAddress >> 8u) & 0xffu) << 24u),
@@ -172,9 +200,13 @@ std::uint32_t Bits(float value) {
 
 // Draws a full-target triangle at depth `z` into the depth surface at `address`, which makes the driver create the
 // surface (the base slice a later plane copy reads from the surface instead of from guest memory).
-void DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2D extent, VkFormat format, float z, std::uint32_t samples = 1) {
+AgcDriver::Graphics::ColorTarget DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2D extent, VkFormat format, float z, std::uint32_t samples = 1, AgcDriver::Graphics::MixedSampleApproximation approximation = AgcDriver::Graphics::MixedSampleApproximation::None, VkCompareOp compare = VK_COMPARE_OP_ALWAYS, bool edge = false, std::optional<float> alpha = std::nullopt) {
     static std::deque<std::vector<std::array<float, 4>>> vertexData;
     vertexData.push_back({{-1.0f, -1.0f, z, 1.0f}, {3.0f, -1.0f, z, 1.0f}, {-1.0f, 3.0f, z, 1.0f}});
+    if (edge) {
+        const auto x = -1.0f + 1.0f / static_cast<float>(extent.width);
+        vertexData.back() = {{-3.0f, -1.0f, z, 1.0f}, {x, -1.0f, z, 1.0f}, {x, 3.0f, z, 1.0f}};
+    }
     const auto& vertices = vertexData.back();
     const auto target = device.Target();
     std::vector<std::uint32_t> vertexUserData(4, 0u);
@@ -196,11 +228,14 @@ void DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2
     pixelInfo.posX = true;
     pixelInfo.posY = true;
     pixelInfo.targetOutputMode[0] = 9;
+    pixelInfo.alphaToCoverage = alpha.has_value();
     pixelInfo.targetExportMapping.fill(0xe4u);
     std::vector<std::uint32_t> pixelUserData(4, 0u);
-    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(PixelCode.data()), std::as_bytes(std::span(PixelCode))}}};
+    if (alpha) pixelUserData[0] = Bits(*alpha);
+    const std::span<const std::uint32_t> pixelCode = alpha ? std::span<const std::uint32_t>(AlphaPixelCode) : std::span<const std::uint32_t>(PixelCode);
+    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(pixelCode.data()), std::as_bytes(pixelCode)}}};
     ShaderRecompiler::RecompileRequest fragmentRequest{
-        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(PixelCode.data()), PixelCode, 0, {}},
+        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(pixelCode.data()), pixelCode, 0, {}},
         {32, 0, pixelUserData, std::nullopt, pixelInfo, std::nullopt, pixelMemory},
         target,
         PixelPushLayout(vertexPush, target)
@@ -219,13 +254,22 @@ void DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2
     state.depth = AgcDriver::Graphics::DepthTarget{address, 0, extent, format, 1.0f, 0};
     state.samples = samples;
     state.depth->samples = samples;
-    if (samples > 1) {
+    if (samples > 1 || alpha) {
         state.hasColorTarget = false;
         state.colors.clear();
     }
+    state.alphaToCoverage = alpha.has_value();
+    state.alphaWithoutColor = alpha.has_value();
+    if (approximation == AgcDriver::Graphics::MixedSampleApproximation::WithoutDepth) {
+        state.color.address = reinterpret_cast<std::uintptr_t>(MixedPixels.data());
+        state.color.samples = 4;
+        state.color.tileMode = AgcDriver::Graphics::ColorTileMode::RenderTarget;
+        state.colors = {state.color};
+        state.hasColorTarget = true;
+    }
     state.depthTest = true;
     state.depthWrite = true;
-    state.depthCompare = VK_COMPARE_OP_ALWAYS;
+    state.depthCompare = compare;
     state.renderExtent = extent;
     state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     state.viewport = {0, static_cast<float>(extent.height), static_cast<float>(extent.width), -static_cast<float>(extent.height), 0, 1};
@@ -235,25 +279,35 @@ void DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2
     state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
-    if (samples > 1) state.blends.clear();
+    if (!state.hasColorTarget) state.blends.clear();
     state.blendConstants = {};
+    if (approximation != AgcDriver::Graphics::MixedSampleApproximation::None) {
+        state.samples = 4;
+        AgcDriver::Graphics::ApplyMixedSampleApproximation(state);
+        Require(state.mixedSampleApproximation == approximation, "GPU mixed-sample test selected the wrong approximation");
+    }
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(vertices.size()), 0, 1, 0, false};
     device.Draw(state, draw, shaders);
     device.WaitIdle();
+    return state.color;
 }
 
 // Loads row 0 of `slice` of the texture `shape` describes at `texels` into `output` (one dword per thread). With
 // `shaderImage2D` the shader declares a 2D image whatever the T#'s type is.
-void Load(AgcDriver::VulkanDevice& device, std::uint8_t* texels, const Shape& shape, std::uint32_t slice, std::span<std::uint32_t> output, bool shaderImage2D = false) {
-    const std::span<const std::uint32_t> code = shape.samples > 1 && shape.type == 15u && !shaderImage2D ? std::span<const std::uint32_t>(LoadMultisampleArray) : std::span<const std::uint32_t>(shape.samples > 1 ? LoadMultisample : shaderImage2D ? Load2D : shape.type == TypeCube ? LoadCube : shape.type == Type2DArray ? LoadArray : Load2D);
+void Load(AgcDriver::VulkanDevice& device, std::uint8_t* texels, const Shape& shape, std::uint32_t slice, std::span<std::uint32_t> output, bool shaderImage2D = false, bool resolveDepth = false, bool sampleDepth = false, bool store = false) {
+    const std::span<const std::uint32_t> code = store ? std::span<const std::uint32_t>(Store2D) : sampleDepth ? std::span<const std::uint32_t>(Sample2D) : resolveDepth ? std::span<const std::uint32_t>(Load2D) : shape.samples > 1 && shape.type == 15u && !shaderImage2D ? std::span<const std::uint32_t>(LoadMultisampleArray) : std::span<const std::uint32_t>(shape.samples > 1 ? LoadMultisample : shaderImage2D ? Load2D : shape.type == TypeCube ? LoadCube : shape.type == Type2DArray ? LoadArray : Load2D);
     std::vector<std::uint32_t> userData(16, 0u);
     const auto out = std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(output.data())), static_cast<std::uint32_t>((reinterpret_cast<std::uintptr_t>(output.data()) >> 32u) & 0xffffu), static_cast<std::uint32_t>(output.size_bytes()), 0x31016facu};
     const auto texture = TextureDescriptor(texels, shape);
     std::copy(out.begin(), out.end(), userData.begin());
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
     userData[12] = slice;
+    if (sampleDepth) {
+        const std::array<std::uint32_t, 4> sampler{0x92u, 0x00fff000u, 0u, 0u};
+        std::copy(sampler.begin(), sampler.end(), userData.begin() + 12);
+    }
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(std::span(code))}}};
-    const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{store ? 1u : Threads, 1, 1}, 0u, {false, false, false}, false, 1};
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
@@ -364,6 +418,82 @@ void MultisampleCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::sp
     Require(refused, "a multisample depth view with a different sample count was accepted");
 }
 
+void TerminalMipCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    SetTerminalMips("1");
+    for (const auto format : {Format32Float, 62u, 75u}) {
+        auto* base = block.At(format == Format32Float ? 0x1c0000 : format == 62u ? 0x1d0000 : 0x190000);
+        const auto value = Bits(0.875f);
+        std::memcpy(base, &value, sizeof(value));
+        Shape shape{format, 1, 1, Type2DArray, 0, 1};
+        shape.terminalLevel = 8;
+        Load(device, base, shape, 0, output, true, false, true);
+        Expect(output, Bits(0.875f), "sampled terminal-mip placeholder");
+        Load(device, base, shape, Bits(0.5f), output, true, false, false, true);
+        Load(device, base, shape, 0, output, true, false, true);
+        Expect(output, Bits(0.5f), "terminal-mip placeholder refreshed after a storage write");
+    }
+    SetTerminalMips("0");
+}
+
+void AlphaCoverageCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    using Approximation = AgcDriver::Graphics::MixedSampleApproximation;
+    for (const auto samples : {1u, 4u}) {
+        auto* base = block.At(samples == 1 ? 0x130000 : 0x150000);
+        const auto address = reinterpret_cast<std::uintptr_t>(base);
+        Shape shape{Format32Float, 128, 128, samples == 1 ? Type2D : 14u, 0, Swizzle64KbZX};
+        shape.samples = samples;
+        DrawDepth(device, address, {128, 128}, VK_FORMAT_D32_SFLOAT, 0.25f, samples, Approximation::None, VK_COMPARE_OP_ALWAYS, false, 0.25f);
+        Load(device, base, shape, 0, output);
+        Expect(output, Bits(1.0f), "depth-only alpha below threshold did not discard coverage");
+        DrawDepth(device, address, {128, 128}, VK_FORMAT_D32_SFLOAT, 0.375f, samples, Approximation::None, VK_COMPARE_OP_ALWAYS, false, 0.75f);
+        for (std::uint32_t sample = 0; sample < samples; ++sample) {
+            Load(device, base, shape, sample, output);
+            Expect(output, Bits(0.375f), "depth-only alpha above threshold did not retain depth writes");
+        }
+    }
+}
+
+void ResolvedMultisampleCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    using Approximation = AgcDriver::Graphics::MixedSampleApproximation;
+    auto* base = block.At(0x1a0000);
+    const auto address = reinterpret_cast<std::uintptr_t>(base);
+    Shape shape{Format32Float, 128, 128, 14u, 0, Swizzle64KbZX};
+    shape.samples = 4;
+    DrawDepth(device, address, {128, 128}, VK_FORMAT_D32_SFLOAT, 0.3125f, 4, Approximation::None, VK_COMPARE_OP_ALWAYS, true);
+    std::array<std::array<std::uint32_t, Threads>, 4> samples{};
+    for (std::uint32_t sample = 0; sample < 4; ++sample) {
+        Load(device, base, shape, sample, output);
+        std::copy(output.begin(), output.end(), samples[sample].begin());
+    }
+    Require(std::ranges::any_of(samples, [&](const auto& values) { return values != samples[0]; }), "depth resolve fixture did not produce different sample values");
+    SetResolvePolicy("clear");
+    bool refused = false;
+    try { Load(device, base, shape, 0, output, false, true); }
+    catch (const std::runtime_error& error) { refused = std::string(error.what()).find("cannot represent rendered depth") != std::string::npos; }
+    Require(refused, "a clear-only proxy admitted rendered depth");
+    for (const auto* policy : {"sample0", "min", "max"}) {
+        SetResolvePolicy(policy);
+        Load(device, base, shape, 0, output, false, true);
+        for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+            auto expected = samples[0][tid];
+            for (std::uint32_t sample = 1; sample < 4; ++sample) {
+                if (std::string_view(policy) == "min") expected = std::min(expected, samples[sample][tid]);
+                if (std::string_view(policy) == "max") expected = std::max(expected, samples[sample][tid]);
+            }
+            Require(output[tid] == expected, std::string("depth resolve ") + policy + " produced the wrong GPU value at texel " + std::to_string(tid));
+        }
+        const auto first = output[0];
+        Load(device, base, shape, 0, output, false, true, true);
+        Expect(output, first, std::string("ordinary image_sample_lz over resolved depth ") + policy);
+    }
+    DrawDepth(device, address, {128, 128}, VK_FORMAT_D32_SFLOAT, 0.625f, 4);
+    Load(device, base, shape, 0, output, false, true);
+    Expect(output, Bits(0.625f), "depth proxy refreshed after a new draw");
+    Load(device, base, shape, 3, output);
+    Expect(output, Bits(0.625f), "depth resolve preserved the original multisample plane");
+    SetResolvePolicy("off");
+}
+
 void FastClearedMultisampleCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextFor(device);
     auto* base = block.At(0x170000);
@@ -379,6 +509,11 @@ void FastClearedMultisampleCase(AgcDriver::VulkanDevice& device, GuestBlock& blo
         Expect(output, Bits(target.clearDepth), "undrawn fast-cleared multisample depth");
     }
     target.clearDepth = 0.875f;
+    SetResolvePolicy("clear");
+    Load(device, base, shape, 0, output, false, true);
+    Expect(output, Bits(0.625f), "proven-clear single-sample depth proxy");
+    Load(device, base, shape, 0, output, false, true, true);
+    Expect(output, Bits(0.625f), "ordinary image_sample_lz over proven-clear depth");
     bool stencilRefused = false;
     try { AgcDriver::Graphics::DepthSurfaceView(context, target); }
     catch (const std::runtime_error& error) { stencilRefused = std::string(error.what()).find("stencil plane") != std::string::npos; }
@@ -386,12 +521,15 @@ void FastClearedMultisampleCase(AgcDriver::VulkanDevice& device, GuestBlock& blo
     AgcDriver::Graphics::RememberBoundDepthSurface(context.device, target);
     Load(device, base, shape, 3, output);
     Expect(output, Bits(target.clearDepth), "updated bound multisample depth clear value");
+    Load(device, base, shape, 0, output, false, true);
+    Expect(output, Bits(target.clearDepth), "updated proven-clear depth proxy");
     const std::uint32_t uncompressed = 0xffffffffu;
     std::memcpy(metadata + 1024, &uncompressed, sizeof(uncompressed));
     bool refused = false;
-    try { Load(device, base, shape, 0, output); }
+    try { Load(device, base, shape, 0, output, false, true); }
     catch (const std::runtime_error& error) { refused = std::string(error.what()).find("not fast-cleared") != std::string::npos; }
     Require(refused, "partly uncompressed undrawn multisample depth was accepted");
+    SetResolvePolicy("off");
 }
 
 void RefusalCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
@@ -407,10 +545,36 @@ void RefusalCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<s
     Require(refused, "a depth plane array from base slice 1 was not refused");
 }
 
+void MixedSampleCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    using Approximation = AgcDriver::Graphics::MixedSampleApproximation;
+    auto* base = block.At(0x120000);
+    const auto address = reinterpret_cast<std::uintptr_t>(base);
+    const Shape shape{Format32Float, 128, 128, Type2D, 0, Swizzle64KbZX};
+    DrawDepth(device, address, {128, 128}, VK_FORMAT_D32_SFLOAT, 0.25f);
+    DrawDepth(device, address, {128, 128}, VK_FORMAT_D32_SFLOAT, 0.75f, 1, Approximation::SingleSample, VK_COMPARE_OP_LESS);
+    Load(device, base, shape, 0, output);
+    Expect(output, Bits(0.25f), "single-sample approximation retained failing depth tests");
+    DrawDepth(device, address, {128, 128}, VK_FORMAT_D32_SFLOAT, 0.125f, 1, Approximation::SingleSample, VK_COMPARE_OP_LESS);
+    Load(device, base, shape, 0, output);
+    Expect(output, Bits(0.125f), "single-sample approximation retained passing depth writes");
+    const auto color = DrawDepth(device, address, {128, 128}, VK_FORMAT_D32_SFLOAT, 0.0f, 1, Approximation::WithoutDepth);
+    Load(device, base, shape, 0, output);
+    Expect(output, Bits(0.125f), "depth-free approximation changed the omitted depth plane");
+    const std::span<std::uint8_t> resolvedPixels(block.At(0x1e0000), 128 * 128 * 4);
+    AgcDriver::Graphics::ColorTarget resolved{reinterpret_cast<std::uintptr_t>(resolvedPixels.data()), {128, 128}, VK_FORMAT_R8G8B8A8_UNORM, resolvedPixels.size(), 0xe4u};
+    resolved.tileMode = AgcDriver::Graphics::ColorTileMode::RenderTarget;
+    device.ColorMetadataPass({AgcDriver::Graphics::ColorMetadataPass::Mode::Resolve, {resolved}, color});
+    AgcDriver::Graphics::StorageTexture::FlushPending(resolved.address, resolved.bytes);
+    device.WaitIdle();
+    Require(std::ranges::any_of(resolvedPixels, [](std::uint8_t pixel) { return pixel == 255; }), "depth-free approximation did not produce color pixels");
+}
+
 }
 
 int main() {
     try {
+        SetResolvePolicy("off");
+        SetTerminalMips("0");
         GuestBlock block;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
@@ -422,7 +586,11 @@ int main() {
         FirstSliceCase(*device, block, output);
         RefusalCase(*device, block, output);
         MultisampleCase(*device, block, output);
+        ResolvedMultisampleCase(*device, block, output);
+        TerminalMipCase(*device, block, output);
+        AlphaCoverageCase(*device, block, output);
         FastClearedMultisampleCase(*device, block, output);
+        MixedSampleCase(*device, block, output);
         std::puts("depth plane sampling tests passed");
         return 0;
     } catch (const std::exception& error) {

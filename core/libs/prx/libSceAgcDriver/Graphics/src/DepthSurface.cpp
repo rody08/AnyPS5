@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "Optimization/include/Optimization/ResourceMaterializer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
@@ -144,6 +146,45 @@ public:
         return texture;
     }
 
+    std::shared_ptr<Texture> ResolvedSampled(std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, bool force) {
+        using Mode = ShaderRecompiler::ExperimentalDepthResolve;
+        const auto policy = ShaderRecompiler::ExperimentalDepthResolveMode();
+        Require(policy != Mode::Disabled, "experimental depth resolve is disabled");
+        Require(target.samples == 4 && resource.samples == 4 && resource.baseAddress == target.address && (hostFormat == VK_FORMAT_D32_SFLOAT || hostFormat == VK_FORMAT_D32_SFLOAT_S8_UINT) && ResolveTextureFormat(resource.format) == VK_FORMAT_R32_SFLOAT && resource.dimension == TextureDimension::k2D && resource.baseArray == 0 && resource.depthOrLastArray == 0 && resource.baseLevel == 0 && resource.lastLevel == 0, "experimental depth resolve requires a resident four-sample D32 2D depth plane");
+        Require(metadataOnly || policy != Mode::ClearOnly, "experimental clear-only depth proxy cannot represent rendered depth");
+        const auto mode = policy == Mode::Min ? VK_RESOLVE_MODE_MIN_BIT : policy == Mode::Max ? VK_RESOLVE_MODE_MAX_BIT : VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+        Require(metadataOnly || (context.depthResolveModes & mode) != 0, "the device does not support the requested experimental depth resolve mode");
+        if (resolvedDepth == nullptr) {
+            auto copy = target;
+            copy.samples = 1;
+            copy.stencilAddress = 0;
+            copy.format = VK_FORMAT_D32_SFLOAT;
+            copy.htileAddress = 0;
+            copy.htileStencil = false;
+            copy.clearDepth = clearDepth;
+            resolvedDepth = std::make_unique<DepthSurface>(context, copy);
+        }
+        if (force || resolvedWritten != written || resolvedPolicy != policy) {
+            if (metadataOnly) {
+                resolvedDepth->clearDepth = clearDepth;
+                resolvedDepth->pendingClear = VK_IMAGE_ASPECT_DEPTH_BIT;
+                resolvedDepth->ApplyFastClear();
+            } else {
+                resolveDepth(mode);
+            }
+            if (!resolvedLogged || resolvedPolicy != policy) {
+                const auto* name = policy == Mode::ClearOnly ? "clear" : policy == Mode::SampleZero ? "sample0" : policy == Mode::Min ? "min" : "max";
+                std::fprintf(stderr, "[depth-resolve] experimental %s proxy for 0x%llx (%ux%u, 4 -> 1 samples, policy %s); original depth and T# retained\n", metadataOnly ? "proven-clear" : "GPU", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, name);
+                resolvedLogged = true;
+            }
+            resolvedWritten = written;
+            resolvedPolicy = policy;
+        }
+        auto sampled = resource;
+        sampled.samples = 1;
+        return resolvedDepth->Sampled(words, sampled, components);
+    }
+
     bool Holds(const Texture* texture) const {
         return std::any_of(textures.begin(), textures.end(), [&](const auto& entry) { return entry.second.get() == texture; });
     }
@@ -223,6 +264,67 @@ private:
     std::map<std::array<std::uint32_t, 12>, std::shared_ptr<Texture>> textures;
     PlaneStorage depthPlane;
     PlaneStorage stencilPlane;
+    struct ResolvePass {
+        VkRenderPass handle = VK_NULL_HANDLE;
+        std::shared_ptr<Framebuffer> framebuffer;
+    };
+    std::map<VkResolveModeFlagBits, ResolvePass> resolvePasses;
+    std::unique_ptr<DepthSurface> resolvedDepth;
+    std::uint64_t resolvedWritten = 0;
+    ShaderRecompiler::ExperimentalDepthResolve resolvedPolicy = ShaderRecompiler::ExperimentalDepthResolve::Disabled;
+    bool resolvedLogged = false;
+
+    void resolveDepth(VkResolveModeFlagBits mode) {
+        auto& pass = resolvePasses[mode];
+        if (pass.handle == VK_NULL_HANDLE) {
+            std::array<VkAttachmentDescription2, 2> attachments{};
+            for (auto& attachment : attachments) {
+                attachment.sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2;
+                attachment.initialLayout = attachment.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
+                attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            }
+            attachments[0].format = hostFormat;
+            attachments[0].samples = static_cast<VkSampleCountFlagBits>(target.samples);
+            attachments[0].loadOp = attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+            attachments[1].format = resolvedDepth->hostFormat;
+            attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
+            attachments[1].loadOp = attachments[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            const VkAttachmentReference2 source{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, nullptr, 0, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_DEPTH_BIT};
+            const VkAttachmentReference2 destination{VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2, nullptr, 1, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_ASPECT_DEPTH_BIT};
+            const VkSubpassDescriptionDepthStencilResolve resolve{VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE, nullptr, mode, VK_RESOLVE_MODE_NONE, &destination};
+            VkSubpassDescription2 subpass{VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2, &resolve};
+            subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            subpass.pDepthStencilAttachment = &source;
+            VkRenderPassCreateInfo2 info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2};
+            info.attachmentCount = static_cast<std::uint32_t>(attachments.size());
+            info.pAttachments = attachments.data();
+            info.subpassCount = 1;
+            info.pSubpasses = &subpass;
+            Check(context.Function<PFN_vkCreateRenderPass2KHR>("vkCreateRenderPass2KHR")(context.device, &info, nullptr, &pass.handle), "vkCreateRenderPass2KHR experimental depth resolve");
+        }
+        if (pass.framebuffer == nullptr) {
+            const std::array views{view, resolvedDepth->view};
+            pass.framebuffer = std::make_shared<Framebuffer>(context, pass.handle, views, target.extent);
+        }
+        auto* recorder = RecorderFor(context);
+        std::unique_ptr<CommandBatch> batch;
+        if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
+        const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+        constexpr auto stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        constexpr auto access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, stages, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, access);
+        VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        begin.renderPass = pass.handle;
+        begin.framebuffer = pass.framebuffer->Handle();
+        begin.renderArea.extent = target.extent;
+        context.Function<PFN_vkCmdBeginRenderPass>("vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
+        context.Function<PFN_vkCmdEndRenderPass>("vkCmdEndRenderPass")(commands);
+        RecordMemoryBarrier(context, commands, stages, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, access, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        if (batch) batch->SubmitAndWait();
+        else Recorder::CountBarriers(Recorder::CommandClass::Copy, 2);
+    }
 
     void copyPlane(PlaneStorage& plane, bool stencil, bool toStorage) {
         auto* recorder = Recorder::Active();
@@ -248,6 +350,12 @@ private:
     }
 
     void release() noexcept {
+        for (auto& [mode, pass] : resolvePasses) {
+            pass.framebuffer.reset();
+            if (pass.handle) context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(context.device, pass.handle, nullptr);
+        }
+        resolvePasses.clear();
+        resolvedDepth.reset();
         depthPlane = {};
         stencilPlane = {};
         textures.clear();
@@ -622,7 +730,7 @@ void ClearDepthSurfaces(VkDevice device) {
     std::erase_if(boundDepthTargets(), [&](const auto& entry) { return entry.first.first == device; });
 }
 
-std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
+std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, bool resolveMultisample) {
     const auto held = [&](const auto& surface) {
         return surface->context.device == context.device && (surface->target.address == resource.baseAddress || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress));
     };
@@ -674,6 +782,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     if (!stencil && format != (d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT) && !depthBits && !integer) return nullptr;
     if (stencil && BytesPerElement(resource.format) != 1u) return nullptr;
     (*found)->ApplyFastClear();
+    if (resolveMultisample) return (*found)->ResolvedSampled(words, resource, components, found->get() == drawnDepth);
     const bool cube = resource.dimension == TextureDimension::kCube;
     const bool layered = cube || (resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray != 0);
     if (stencil || (!layered && !integer)) return (*found)->Sampled(words, resource, components);

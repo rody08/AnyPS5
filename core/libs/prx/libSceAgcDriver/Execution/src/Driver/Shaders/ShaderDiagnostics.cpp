@@ -54,18 +54,20 @@ std::string Driver::dumpRequest(std::uint64_t address, const ShaderRecompiler::R
     static std::set<std::uint64_t> dumped;
     char name[64];
     std::snprintf(name, sizeof(name), "shader_%llx.req", static_cast<unsigned long long>(address));
+    const char* directory = std::getenv("APS5_SHADER_DUMP_DIR");
+    const auto path = directory ? std::string(directory) + "/" + name : std::string(name);
     std::lock_guard lock(dumpMutex);
-    if (!dumped.insert(address).second) return name;
+    if (!dumped.insert(address).second) return path;
     try {
         const auto text = ShaderRecompiler::RequestSerializer{}.Serialize(request);
-        if (std::FILE* file = std::fopen(name, "wb")) {
+        if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
             std::fwrite(text.data(), 1, text.size(), file);
             std::fclose(file);
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[gpu] could not serialize request for 0x%llx: %s\n", static_cast<unsigned long long>(address), error.what());
     }
-    return name;
+    return path;
 }
 
 }

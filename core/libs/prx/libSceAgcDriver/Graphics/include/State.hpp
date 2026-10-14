@@ -80,6 +80,8 @@ struct DepthTarget {
     std::uint32_t samples = 1;
 };
 
+enum class MixedSampleApproximation { None, SingleSample, WithoutDepth };
+
 struct State {
     ShaderStages stages;
     std::optional<DepthTarget> depth;
@@ -114,6 +116,7 @@ struct State {
     bool negativeOneToOne;
     bool depthClamp = false;
     bool alphaToCoverage = false;
+    bool alphaWithoutColor = false;
     VkConservativeRasterizationModeEXT conservativeRasterization = VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT;
     VkRect2D scissor;
     VkCullModeFlags cullMode;
@@ -122,6 +125,8 @@ struct State {
     VkPipelineColorBlendAttachmentState blend;
     std::array<float, 4> blendConstants;
     std::uint32_t samples = 1;
+    std::uint32_t requestedSamples = 1;
+    MixedSampleApproximation mixedSampleApproximation = MixedSampleApproximation::None;
     std::array<std::uint8_t, 8> sampleLocations{};
     bool customSampleLocations = false;
     std::uint32_t paClVsOutCntl = 0;
@@ -134,6 +139,9 @@ inline constexpr std::uint32_t PositionExportLayoutBits = 0xffffu | (1u << 21u) 
 
 ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup = false);
 State DecodeState(const QueueState& queue, bool vertexWorkgroup = false);
+bool MixedSampleApproximationEnabled();
+bool AlphaWithoutColorEnabled();
+void ApplyMixedSampleApproximation(State& state);
 std::array<VkSampleLocationEXT, 8> SampleLocations(const State& state);
 std::array<std::uint8_t, 8> ExportMappings(const State& state);
 std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& state);

@@ -20,10 +20,22 @@
 #include <unordered_map>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace ShaderRecompiler {
+
+ExperimentalDepthResolve ExperimentalDepthResolveMode() {
+    const auto* value = std::getenv("APS5_EXPERIMENTAL_DEPTH_RESOLVE");
+    if (value == nullptr || *value == '\0' || std::string_view(value) == "off") return ExperimentalDepthResolve::Disabled;
+    const std::string_view mode(value);
+    if (mode == "clear") return ExperimentalDepthResolve::ClearOnly;
+    if (mode == "sample0") return ExperimentalDepthResolve::SampleZero;
+    if (mode == "min") return ExperimentalDepthResolve::Min;
+    if (mode == "max") return ExperimentalDepthResolve::Max;
+    throw std::runtime_error("APS5_EXPERIMENTAL_DEPTH_RESOLVE must be off, clear, sample0, min or max");
+}
 
 namespace {
 
@@ -151,6 +163,9 @@ DecodedImage decodeImageDescriptor(const DescriptorValue& descriptor, const Imag
     decoded.dimension = descriptorDimension(descriptor, base.dimension);
     decoded.cube = descriptorIsCube(descriptor);
     const auto format = rawImageFormat(descriptor);
+    if (ExperimentalDepthResolveMode() != ExperimentalDepthResolve::Disabled && base.dimension == RdnaImageDimension::Dim2D && base.resourceClass == ImageResourceClass::Sampled && !base.depthCompare && !base.packed && !base.r128 && base.byElements == 0u && base.indirectRoot == ImageResource::NoIndirectImage && rawImageType(descriptor) == ImageType::Color2DMsaa && format == IrBufferFormat::Format32Float && ((descriptor.dwords[3] >> 16u) & 0xfu) == 2u && descriptor.dwords[4] == 0u) {
+        decoded.dimension = RdnaImageDimension::Dim2D;
+    }
     if (base.atomic64 && format != IrBufferFormat::Format32_32UInt && format != IrBufferFormat::Format32_32SInt && format != IrBufferFormat::Format32_32Float) {
         throw std::runtime_error("64-bit atomic image descriptor uses an unsupported format " + std::to_string(static_cast<std::uint32_t>(format)));
     }
@@ -823,7 +838,7 @@ std::uint32_t ResourceMaterializer::RuntimeImageMode(const ImageResource& image,
     const auto describe = [](IrTextureNumericClass numeric, RdnaImageDimension dimension, IrBufferFormat conversion, IrBufferFormat packed, bool cube, bool depthBits, bool depthUnorm16, bool srgb) {
         return "{class " + std::to_string(static_cast<int>(numeric)) + ", dim " + std::to_string(static_cast<int>(dimension)) + ", conversion " + std::to_string(static_cast<int>(conversion)) + ", packed " + std::to_string(static_cast<int>(packed)) + ", cube " + std::to_string(cube) + ", depthBits " + std::to_string(depthBits) + ", unorm16 " + std::to_string(depthUnorm16) + ", srgb " + std::to_string(srgb) + "}";
     };
-    std::string message = "image descriptor is incompatible with the static runtime image interface: descriptor format " + std::to_string(static_cast<int>(format)) + " decodes to " + describe(decoded.numericClass, decoded.dimension, decoded.conversionFormat, decoded.packedFormat, decoded.cube, decoded.depthBits, decoded.depthUnorm16, decoded.srgbDecode) + (emulated ? " (emulated compare)" : "") + "; modes:";
+    std::string message = "image descriptor is incompatible with the static runtime image interface: descriptor format " + std::to_string(static_cast<int>(format)) + " decodes to " + describe(decoded.numericClass, decoded.dimension, decoded.conversionFormat, decoded.packedFormat, decoded.cube, decoded.depthBits, decoded.depthUnorm16, decoded.srgbDecode) + (emulated ? " (emulated compare)" : "") + "; requested dimension " + std::to_string(static_cast<int>(image.dimension)) + ", first use PC " + std::to_string(image.firstUsePc) + ", resource source " + std::to_string(image.source) + "; modes:";
     for (const auto& mode : modes) message += " " + describe(mode.numericClass, mode.dimension, mode.conversionFormat, mode.packedFormat, mode.cube, mode.depthBits, mode.depthUnorm16, mode.srgbDecode);
     char words[96];
     std::snprintf(words, sizeof(words), "; T# %08x %08x %08x %08x %08x %08x %08x %08x", descriptor.dwords[0], descriptor.dwords[1], descriptor.dwords[2], descriptor.dwords[3], descriptor.dwords[4], descriptor.dwords[5], descriptor.dwords[6], descriptor.dwords[7]);

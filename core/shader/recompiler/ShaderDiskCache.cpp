@@ -685,6 +685,7 @@ void decodeAllocation(Reader& reader, CompiledBindingLayout& allocation) {
 }
 
 constexpr std::string_view NeutralSwitches[] = {
+    "APS5_EXPERIMENTAL_DEPTH_RESOLVE",
     "APS5_PROFILE_DRAW",
     "APS5_DUMP_IR",
     "APS5_NO_CODE_HASH_KEY",
@@ -915,6 +916,7 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, s
     writer.Values(std::span<const std::uint64_t>(memoryKey));
     writer.Values(request.shader.code);
     writer.Value(hostSubgroupSize);
+    writer.Value(ExperimentalDepthResolveMode());
     writer.Value(request.layout.descriptorSet);
     writer.Value(request.layout.firstBinding);
     writer.Value(request.layout.pushConstantOffsetBytes);

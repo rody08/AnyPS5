@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -92,9 +93,46 @@ void rejectFields(const Fields& f, std::string_view reason) {
     reject([&] { DecodeTextureResource(words); }, reason);
 }
 
+void setTerminalMips(const std::string& value) {
+#ifdef _WIN32
+    _putenv_s("APS5_APPROXIMATE_TERMINAL_MIPS", value.c_str());
+#else
+    setenv("APS5_APPROXIMATE_TERMINAL_MIPS", value.c_str(), 1);
+#endif
+}
+
+void terminalMipApproximation() {
+    const auto* previous = std::getenv("APS5_APPROXIMATE_TERMINAL_MIPS");
+    const std::string saved = previous != nullptr ? previous : "";
+    setTerminalMips("0");
+    const std::array<std::uint32_t, 8> captured{0x15834206u, 0x03e00000u, 0u, 0xd018802cu, 0u, 0x00700000u, 0u, 0u};
+    reject([&] { DecodeTextureResource(captured); }, "would move the surface's own");
+    setTerminalMips("1");
+    const auto decoded = DecodeTextureResource(captured);
+    Require(decoded.approximatedTerminalMip && decoded.baseAddress == 0x1583420600ull && decoded.width == 1 && decoded.height == 1 && decoded.baseLevel == 0 && decoded.lastLevel == 0 && decoded.allocatedMipCount == 1 && DescribeSurface(decoded).guestBytes == 256, "terminal-mip approximation changed the placeholder allocation");
+    auto rgba = captured;
+    rgba[0] = 0x15834cb5u;
+    rgba[1] = 0x04b00000u;
+    rgba[3] = 0xd0188facu;
+    Require(DecodeTextureResource(rgba).approximatedTerminalMip && DescribeSurface(DecodeTextureResource(rgba)).guestBytes == 256, "captured RGBA32_UINT terminal placeholder was not preserved");
+    auto rejected = captured;
+    rejected[2] = 1;
+    reject([&] { DecodeTextureResource(rejected); }, "would move the surface's own");
+    rejected = captured;
+    rejected[4] = 1;
+    reject([&] { DecodeTextureResource(rejected); }, "would move the surface's own");
+    rejected = captured;
+    rejected[1] = 56u << 20u;
+    reject([&] { DecodeTextureResource(rejected); }, "would move the surface's own");
+    const auto ordinary = DecodeTextureResource(pack(Fields{}));
+    Require(!ordinary.approximatedTerminalMip && ordinary.mipCount == 1 && ordinary.baseLevel == 0, "terminal-mip approximation changed an ordinary view");
+    setTerminalMips(saved);
+}
+
 }
 
 void RunGuestTextureResourceTests() {
+    terminalMipApproximation();
     Fields base;
     auto result = DecodeTextureResource(pack(base));
     Require(result.baseAddress == (base.base40 << 8u), "decoded base address changed");

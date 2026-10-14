@@ -882,6 +882,56 @@ void verifyBindingPlanSelection() {
     rejectsAlignment("base is not aligned to its element");
 }
 
+void verifyMultisampleDescriptorDimensions() {
+    const auto* previous = std::getenv("APS5_EXPERIMENTAL_DEPTH_RESOLVE");
+    const std::string saved = previous != nullptr ? previous : "";
+    setEnvironment("APS5_EXPERIMENTAL_DEPTH_RESOLVE", "off");
+    SampleRequest request;
+    const auto strictKey = request.Key();
+    const auto strictContextKey = RecompileCacheKey::ContextHash(request.request);
+    ImageResource image{};
+    image.dimension = RdnaImageDimension::Dim2D;
+    image.resourceClass = ImageResourceClass::Sampled;
+    image.firstUsePc = 28;
+    DescriptorValue descriptor{};
+    descriptor.dwordCount = 8;
+    descriptor.dwords = {0x14a27100u, 0xc1600000u, 0x021bc3bfu, 0xe1820204u, 0u, 0x00700020u, 0x00280400u, 0x0014a267u};
+    bool refused = false;
+    try {
+        static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, descriptor, ResourceMaterializer::RuntimeImageModes(image)));
+    } catch (const std::runtime_error& error) {
+        const std::string_view message(error.what());
+        refused = message.find("incompatible with the static runtime image interface") != std::string_view::npos && message.find("first use PC 28") != std::string_view::npos;
+    }
+    require(refused, "a sampled 2D image admitted a multisample descriptor or lost its first-use diagnostic");
+    const auto original = descriptor.dwords;
+    for (const auto* policy : {"clear", "sample0", "min", "max"}) {
+        setEnvironment("APS5_EXPERIMENTAL_DEPTH_RESOLVE", policy);
+        require(request.Key() != strictKey && RecompileCacheKey::ContextHash(request.request) != strictContextKey, "depth resolve policy was missing from a shader cache key");
+        const auto modes = ResourceMaterializer::RuntimeImageModes(image);
+        const auto selected = ResourceMaterializer::RuntimeImageMode(image, descriptor, modes);
+        require(modes.at(selected).dimension == RdnaImageDimension::Dim2D && descriptor.dwords == original, "experimental depth resolve changed the descriptor or lost the 2D interface");
+        auto comparison = image;
+        comparison.depthCompare = true;
+        bool rejected = false;
+        try { static_cast<void>(ResourceMaterializer::RuntimeImageMode(comparison, descriptor, ResourceMaterializer::RuntimeImageModes(comparison))); }
+        catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "experimental depth resolve admitted comparison sampling");
+        auto twoSamples = descriptor;
+        twoSamples.dwords[3] = (twoSamples.dwords[3] & ~(0xfu << 16u)) | (1u << 16u);
+        twoSamples.dwords[5] = (twoSamples.dwords[5] & ~(0xfu << 4u)) | (1u << 4u);
+        rejected = false;
+        try { static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, twoSamples, modes)); }
+        catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "experimental depth resolve admitted an unmodeled sample count");
+    }
+    image.dimension = RdnaImageDimension::Dim2DMsaa;
+    const auto modes = ResourceMaterializer::RuntimeImageModes(image);
+    const auto selected = ResourceMaterializer::RuntimeImageMode(image, descriptor, modes);
+    require(modes.at(selected).dimension == RdnaImageDimension::Dim2DMsaa, "a multisample load lost its image dimension");
+    setEnvironment("APS5_EXPERIMENTAL_DEPTH_RESOLVE", saved);
+}
+
 void verifyNullMultisampleBindingPlans() {
     for (const auto dimension : {RdnaImageDimension::Dim2DMsaa, RdnaImageDimension::Dim2DMsaaArray}) {
         ShaderInfo info{};
@@ -1145,6 +1195,7 @@ int main(int argc, char** argv) {
         verifyBufferAlignmentSpecialization();
         verifyBindingPlanSelection();
         verifyNullMultisampleBindingPlans();
+        verifyMultisampleDescriptorDimensions();
         verifyVertexTypeSpecialization();
         verifyBuiltinSpecialization();
         verifySpecializationLiveness();

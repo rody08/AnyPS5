@@ -214,6 +214,12 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     if (state.stages.tessellation) appendKey(keys.preRasterization, state.stages.tessellation->inputControlPoints);
     appendKey(keys.fragmentShader, state.samples);
     appendKey(keys.fragmentOutput, state.samples);
+    appendKey(keys.fragmentShader, state.requestedSamples);
+    appendKey(keys.fragmentShader, state.alphaWithoutColor);
+    appendKey(keys.fragmentOutput, state.alphaWithoutColor);
+    appendKey(keys.fragmentShader, state.mixedSampleApproximation);
+    appendKey(keys.fragmentOutput, state.requestedSamples);
+    appendKey(keys.fragmentOutput, state.mixedSampleApproximation);
     const auto sampleLocationsEnabled = ValidateSampleLocations(context, state);
     appendKey(keys.fragmentShader, sampleLocationsEnabled);
     appendKey(keys.fragmentOutput, sampleLocationsEnabled);
@@ -787,6 +793,8 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
     for (const auto& blend : state.blends) append(key, blend);
     for (const auto value : state.blendConstants) append(key, value);
     append(key, state.samples);
+    append(key, state.requestedSamples);
+    append(key, state.mixedSampleApproximation);
     append(key, state.customSampleLocations);
     if (state.customSampleLocations) append(key, state.sampleLocations);
     append(key, state.colors.size());

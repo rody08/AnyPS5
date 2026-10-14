@@ -8,6 +8,9 @@
 
 namespace ShaderRecompiler {
 
+enum class ExperimentalDepthResolve { Disabled, ClearOnly, SampleZero, Min, Max };
+ExperimentalDepthResolve ExperimentalDepthResolveMode();
+
 // Why a bindless image table (a T# loaded from a table buffer at a runtime key) was not bound;
 // counted on the [bindless] line (APS5_PROFILE_DRAW).
 enum class BindlessRejection { Capacity, MaterialScan, NoEntry, Storage, NonUniform, ImageSlots, Count };

@@ -2051,6 +2051,79 @@ VKAPI_ATTR VkResult VKAPI_CALL sampleLocationDepthProperties(VkPhysicalDevice, V
     return depthSampleResult;
 }
 
+void mixedSampleApproximationTests() {
+    using namespace AgcDriver::Graphics;
+    const auto setVariable = [](const char* value) {
+#ifdef _WIN32
+        _putenv_s("APS5_APPROXIMATE_MIXED_SAMPLES", value);
+#else
+        if (*value == 0) unsetenv("APS5_APPROXIMATE_MIXED_SAMPLES");
+        else setenv("APS5_APPROXIMATE_MIXED_SAMPLES", value, 1);
+#endif
+    };
+    const char* previous = std::getenv("APS5_APPROXIMATE_MIXED_SAMPLES");
+    const std::string original = previous ? previous : "";
+    struct Restore {
+        decltype(setVariable)& set;
+        const std::string& value;
+        ~Restore() { set(value.c_str()); }
+    } restore{setVariable, original};
+    auto queue = makeState();
+    queue.context[0x000] = queue.context[0x002] = queue.context[0x011] = queue.context[0x00a] = 0;
+    queue.context[0x007] = 63u | (63u << 16u);
+    queue.context[0x00b] = std::bit_cast<std::uint32_t>(1.0f);
+    queue.context[0x010] = 0x20000003u;
+    queue.context[0x005] = 0x120000u;
+    queue.context[0x012] = queue.context[0x014] = 0x123400u;
+    queue.context[0x200] = 0x36u;
+    queue.context[0x2f8] = 0x0020c002u;
+    queue.context[0x292] = 3;
+    queue.context[0x1b3] = queue.context[0x1b4] = 2;
+    for (std::uint32_t pixel = 0; pixel < 4; ++pixel) queue.context[0x2fe + pixel * 4u] = 0x622ae6aeu;
+    const auto originalQueue = queue;
+    setVariable("");
+    expectFailure([&] { DecodeState(queue); }, "depth target's sample count differs");
+    setVariable("0");
+    expectFailure([&] { DecodeState(queue); }, "depth target's sample count differs");
+    setVariable("invalid");
+    expectFailure([&] { DecodeState(queue); }, "APS5_APPROXIMATE_MIXED_SAMPLES must be");
+    setVariable("1");
+    auto state = DecodeState(queue);
+    Require(state.samples == 1 && state.requestedSamples == 4 && state.mixedSampleApproximation == MixedSampleApproximation::SingleSample, "mixed one-sample attachments did not use one raster sample");
+    Require(state.depth && state.depthTest && state.depthWrite && state.boundDepth && state.boundDepth->htileAddress == 0x12000000u, "single-sample approximation lost depth tests, writes or bound metadata");
+    Require(!state.customSampleLocations && SampleLocations(state)[0].x == 0.5f && SampleLocations(state)[0].y == 0.5f, "single-sample approximation did not center its sample");
+    Require(DrawRejection(queue, false).empty(), "precheck rejected the approximated draw");
+    Require(queue.context == originalQueue.context && queue.shader == originalQueue.shader && queue.userConfig == originalQueue.userConfig, "approximation modified guest registers");
+    queue.context[0x8e] = queue.context[0x8f] = 0;
+    state = DecodeState(queue);
+    Require(!state.hasColorTarget && state.depth && state.samples == 1, "depth-only mixed samples did not retain the depth attachment");
+    queue = originalQueue;
+    queue.context[0x31d] = 0x12000u;
+    state = DecodeState(queue);
+    Require(!state.depth && state.samples == 4 && state.requestedSamples == 4 && state.mixedSampleApproximation == MixedSampleApproximation::WithoutDepth, "four-sample color did not omit mismatched depth");
+    Require(!state.depthTest && !state.depthWrite && !state.depthBoundsTest && !state.stencilTest && !state.depthBias && state.boundDepth && state.boundDepth->samples == 1, "depth-free approximation retained tests or lost bound metadata");
+    queue.context[0x31d] = 0x9000u;
+    expectFailure([&] { DecodeState(queue); }, "uniformly one-sample or four-sample");
+    queue = originalQueue;
+    for (const auto offset : {0x318u, 0x31bu, 0x31cu, 0x31du}) queue.context[offset + 0xfu] = queue.context.at(offset);
+    for (const auto offset : {0x390u, 0x3b0u, 0x3b8u}) queue.context[offset + 1u] = queue.context.at(offset);
+    queue.context[0x31d + 0xfu] = 0x12000u;
+    queue.context[0x1c5] = 0x99u;
+    queue.context[0x8e] = queue.context[0x8f] = 0xffu;
+    expectFailure([&] { DecodeState(queue); }, "uniformly one-sample or four-sample");
+    queue = originalQueue;
+    queue.context[0x010] = 0x2000000bu;
+    queue.context[0x31d] = 0x12000u;
+    state = DecodeState(queue);
+    Require(state.samples == 4 && state.depth && state.mixedSampleApproximation == MixedSampleApproximation::None, "matching four-sample attachments were approximated");
+    queue = originalQueue;
+    queue.context[0x2f8] = 0;
+    queue.context[0x292] = 2;
+    state = DecodeState(queue);
+    Require(state.samples == 1 && state.depth && state.mixedSampleApproximation == MixedSampleApproximation::None, "matching one-sample attachments were approximated");
+    std::cout << "Mixed-sample approximation checks passed\n";
+}
+
 void multisampleTests() {
     using AgcDriver::Graphics::ColorMetadataPass;
     using AgcDriver::Graphics::DecodeColorMetadataPass;
@@ -2503,6 +2576,30 @@ void AlphaToCoverageTests() {
         expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "floating-point alpha");
     }
     queue.context[0x1c5] = exportFormat;
+    queue.context[0x8e] = queue.context[0x8f] = 0;
+    queue.context[0x000] = queue.context[0x002] = queue.context[0x011] = queue.context[0x00a] = 0;
+    queue.context[0x007] = 63u | (63u << 16u);
+    queue.context[0x00b] = std::bit_cast<std::uint32_t>(1.0f);
+    queue.context[0x010] = 0x20000003u;
+    queue.context[0x012] = queue.context[0x014] = 0x123400u;
+    queue.context[0x200] = 0x36u;
+    const auto* previous = std::getenv("APS5_ALPHA_WITHOUT_COLOR");
+    const std::string saved = previous != nullptr ? previous : "";
+    const auto set = [](const char* value) {
+#ifdef _WIN32
+        _putenv_s("APS5_ALPHA_WITHOUT_COLOR", value);
+#else
+        setenv("APS5_ALPHA_WITHOUT_COLOR", value, 1);
+#endif
+    };
+    set("0");
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "without a written MRT0");
+    set("1");
+    const auto state = AgcDriver::Graphics::DecodeState(queue);
+    Require(state.alphaToCoverage && state.alphaWithoutColor && state.colors.empty() && state.depth && state.depthWrite && queue.context.at(0x2dc) == 0xaa01, "depth-only alpha coverage lost its mask, depth writes or guest register");
+    queue.context[0x1c5] = 1;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "floating-point alpha");
+    set(saved.c_str());
 }
 
 void InitialContextTests() {
@@ -5623,6 +5720,10 @@ int main(int argc, char** argv) {
             std::cout << "Covered-centroid and multisample state checks passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--mixed-sample-approximation") {
+            mixedSampleApproximationTests();
+            return 0;
+        }
         {
             const AgcDriver::Graphics::Context context{};
             const AgcDriver::Graphics::State state{};
@@ -5655,6 +5756,7 @@ int main(int argc, char** argv) {
         }
         RunGuestLeaseWaitTests();
         stateTests();
+        mixedSampleApproximationTests();
         pipelineLibrarySetTests();
         hdrComponentSwapTests();
         depthMaintenanceTests();

@@ -25,6 +25,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libc/include/General.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
+#include "Optimization/include/Optimization/ResourceMaterializer.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <cstring>
 #include <limits>
@@ -1715,6 +1716,7 @@ void ShaderResources::noteReusable() {
     captureValidation();
     reusable = false;
     directRegions.clear();
+    if (resolvedDepth || resolvedTerminalMip) return;
     if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || (bda != nullptr && LoopGuardEnabled())) return;
     if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) return;
@@ -3309,10 +3311,12 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 continue;
             }
             const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
+            resolvedTerminalMip |= resource.approximatedTerminalMip;
             RequireDegammaFormat(resource.format, binding.imageSamplers[element], shaderSamplers);
             RequireNonSeamlessCube(resource.dimension == TextureDimension::kCube, binding.imageSamplers[element], shaderSamplers);
             const bool firstLayer = ((binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.samples == 1) || (binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2DMultisample && resource.samples > 1)) && resource.dimension == TextureDimension::k2DArray;
-            if (!firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension, resource.samples)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
+            const bool resolveDepth = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.samples == 4 && resource.dimension == TextureDimension::k2D && resource.format == 22u && ShaderRecompiler::ExperimentalDepthResolveMode() != ShaderRecompiler::ExperimentalDepthResolve::Disabled;
+            if (!resolveDepth && !firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension, resource.samples)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
             const VkComponentMapping components = ViewComponents(resource);
             const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : resource.samples > 1 ? 0u : DescribeSurface(resource).guestBytes;
             if (guestBytes != 0) {
@@ -3321,7 +3325,13 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             }
             std::shared_ptr<Texture> texture;
             const bool depthCompare = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
-            if (previousSampled.texture != nullptr && previousSampled.depthCompare == depthCompare && words.size() == 8 && std::equal(words.begin(), words.end(), previousSampled.words.begin())) texture = previousSampled.texture;
+            if (resolveDepth) {
+                Require(!depthCompare, "experimental depth resolve does not support comparison sampling");
+                texture = DepthSurfaceTexture(context, words, resource, components, true);
+                Require(texture != nullptr, "experimental depth resolve requires matching resident or proven-clear depth; guest multisample bytes cannot be uploaded as a single-sample image");
+                resolvedDepth = true;
+            }
+            if (!resolveDepth && previousSampled.texture != nullptr && previousSampled.depthCompare == depthCompare && words.size() == 8 && std::equal(words.begin(), words.end(), previousSampled.words.begin())) texture = previousSampled.texture;
             if (texture == nullptr && record != nullptr && record->texture != nullptr) {
                 texture = fastTexture(*record);
                 (texture != nullptr ? counters.fastHits : counters.fastMisses).fetch_add(1, std::memory_order_relaxed);
@@ -3339,7 +3349,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             RequireFilterMinmax(context, texture->ViewFormat(), binding.imageSamplers[element], shaderSamplers);
             RequireBorderSwizzle(resource.bcSwizzle, binding.imageSamplers[element], shaderSamplers);
             if (!shaderSamplers.empty()) {
-                const bool singleLevel = DescriptorSingleLevel(words);
+                const bool singleLevel = resolveDepth || DescriptorSingleLevel(words);
                 const auto firstSampler = static_cast<std::size_t>(shaderSamplers.data() - samplers.data());
                 for (std::uint32_t sampler = 0; sampler < shaderSamplers.size() && sampler < 32u; ++sampler) {
                     if (((binding.imageSamplers[element] >> sampler) & 1u) == 0) continue;
@@ -3347,7 +3357,8 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                     (singleLevel ? source.singleLevelImage : source.mipmappedImage) = true;
                 }
             }
-            if (words.size() == 8) {
+            if (resolveDepth) previousSampled = {};
+            else if (words.size() == 8) {
                 std::copy(words.begin(), words.end(), previousSampled.words.begin());
                 previousSampled.depthCompare = depthCompare;
                 previousSampled.texture = texture;
@@ -3378,6 +3389,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             continue;
         }
         const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
+        resolvedTerminalMip |= resource.approximatedTerminalMip;
         Require(resource.samples == 1, "storage access to a multisampled texture is not implemented");
         const bool firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
         if (binding.imageShape.has_value() && !firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest storage texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");

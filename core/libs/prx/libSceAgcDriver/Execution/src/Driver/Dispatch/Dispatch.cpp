@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
@@ -141,6 +142,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         key *= 0x100000001b3ull;
     };
     mix(address);
+    mix(static_cast<std::uint64_t>(ShaderRecompiler::ExperimentalDepthResolveMode()));
+    mix(Graphics::TerminalMipApproximationEnabled());
     mix(packet[4] & 0x8000u);
     for (const auto threads : compute.partialThreads) mix(threads);
     for (const auto word : userData) mix(word);
@@ -271,7 +274,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             totalMs += elapsed;
             if (profile && elapsed > 200) std::fprintf(stderr, "[gpu] compute shader 0x%llx recompile took %.0f ms (%zu SPIR-V words, %zu captured regions, total %.1f s)\n", static_cast<unsigned long long>(address), elapsed, compiledResult->spirv.size(), captured.size(), totalMs / 1000);
         } catch (const std::exception& error) {
-            const auto dump = dumpShaders ? dumpRequest(address, request) : std::string{};
+            if (shaderMemory != nullptr) captured = shaderMemory->Regions();
+            request.context.memory = captured;
+            const auto dump = dumpShaders || std::getenv("APS5_DUMP_FAILED_SHADERS") != nullptr ? dumpRequest(address, request) : std::string{};
 
             std::string reason = error.what();
             if (const auto newline = reason.find('\n'); newline != std::string::npos) reason.resize(newline);
@@ -348,6 +353,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         char where[64];
         std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
+        if (std::getenv("APS5_DUMP_FAILED_SHADERS") != nullptr) {
+            request.context.memory = captured;
+            std::fprintf(stderr, "[gpu] failed compute shader request: %s\n", dumpRequest(address, request).c_str());
+        }
         throw std::runtime_error(where + std::string(error.what()));
     };
     phaseTiming.Phase(PhaseSnapshots);

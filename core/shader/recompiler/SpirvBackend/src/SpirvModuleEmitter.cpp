@@ -1355,6 +1355,10 @@ void EmitSetAttribute(SpirvValueEmitContext& ctx, const IrValue& inst) {
         }
         const auto variable = state.program.Resources().stage == IrShaderStage::Mesh ? 0u : OutputVariableForExport(state, exp);
         if (state.program.Resources().stage != IrShaderStage::Mesh && variable == 0u) {
+            if (state.program.Resources().stage == IrShaderStage::Pixel && exp.kind == ExportTargetKind::Mrt && exp.index == 0u && AlphaToCoverage(state)) {
+                if (MrtOutputMode(state, exp) == 7u) throw std::runtime_error("alpha-to-coverage from an integer MRT0 export is unsupported");
+                StoreAlphaCoverage(state, ExportVector(ctx, data, exp, false));
+            }
             return;
         }
         const bool uintOutput = MrtOutputMode(state, exp) == 7u;

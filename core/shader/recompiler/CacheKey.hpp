@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILER_CACHEKEY_HPP
 
 #include "Recompiler.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
@@ -52,6 +53,7 @@ public:
         append(key, request.context.pixel);
         append(key, request.context.vertex);
         append(key, request.context.floatMode);
+        append(key, ExperimentalDepthResolveMode());
         appendMesh(key, request);
         appendTessellation(key, request);
         std::uint64_t hash = 0xcbf29ce484222325ull;
@@ -77,6 +79,7 @@ public:
 
 private:
     static void appendInterface(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
+        append(key, ExperimentalDepthResolveMode());
         append(key, request.context.waveSize);
         append(key, request.context.userDataBaseRegister);
         append(key, request.context.userData.size());

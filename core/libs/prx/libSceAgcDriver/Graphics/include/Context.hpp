@@ -176,6 +176,7 @@ struct Context {
     bool provokingVertexModePerPipeline = false;
     bool singlePassStorage = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
+    VkResolveModeFlags depthResolveModes = 0;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

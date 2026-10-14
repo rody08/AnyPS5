@@ -16,6 +16,9 @@
 #include <span>
 #include <array>
 #include <sstream>
+#include <atomic>
+#include <filesystem>
+#include <fstream>
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -379,6 +382,34 @@ std::uint32_t decodeSamples(const Registers& cx) {
     return 1u << log2;
 }
 
+void captureMixedSamples(const QueueState& queue, const char* name = "mixed-samples") {
+    static std::atomic<unsigned> captured{0};
+    const auto bit = std::string_view(name) == "mixed-samples" ? 1u : 2u;
+    if ((captured.fetch_or(bit) & bit) != 0) return;
+    const auto word = [](const Registers& registers, std::uint32_t offset) {
+        const auto it = registers.find(offset);
+        return it == registers.end() ? 0u : it->second;
+    };
+    std::fprintf(stderr, "[mixed-samples] DB_Z_INFO=0x%08x DB_DEPTH_CONTROL=0x%08x DB_RENDER_CONTROL=0x%08x CB_TARGET_MASK=0x%08x CB_SHADER_MASK=0x%08x AA_CONFIG=0x%08x SC_MODE_CNTL_0=0x%08x\n", word(queue.context, 0x010), word(queue.context, 0x200), word(queue.context, 0x000), word(queue.context, 0x8e), word(queue.context, 0x8f), word(queue.context, 0x2f8), word(queue.context, 0x292));
+    for (std::uint32_t slot = 0; slot < 8; ++slot) {
+        std::fprintf(stderr, "[mixed-samples] CB%u INFO=0x%08x ATTRIB=0x%08x BASE=0x%08x\n", slot, word(queue.context, 0x31c + slot * 0xfu), word(queue.context, 0x31d + slot * 0xfu), word(queue.context, 0x318 + slot * 0xfu));
+    }
+    const char* directory = std::getenv("APS5_MIXED_SAMPLE_CAPTURE_DIR");
+    if (directory == nullptr) return;
+    const auto path = std::filesystem::path(directory) / (std::string(name) + "-registers.txt");
+    std::fprintf(stderr, "[%s] ALPHA_TO_MASK=0x%08x SPI_SHADER_COL_FORMAT=0x%08x\n", name, word(queue.context, 0x2dc), word(queue.context, 0x1c5));
+    std::ofstream output(path);
+    const auto bank = [&](const char* name, const Registers& registers) {
+        output << name << '\n' << std::hex;
+        for (const auto& [offset, value] : registers) output << offset << ' ' << value << '\n';
+    };
+    bank("context", queue.context);
+    bank("shader", queue.shader);
+    bank("user-config", queue.userConfig);
+    output.close();
+    std::fprintf(stderr, "[mixed-samples] register capture %s: %s\n", output.fail() ? "failed" : "saved", path.string().c_str());
+}
+
 void decodeSampleLocations(const Registers& cx, State& state) {
     const auto samples = state.samples;
     if (samples == 1) return;
@@ -681,6 +712,42 @@ std::string DepthMaintenanceRejection(const QueueState& queue) {
     return zeroMessage(0x000, control->second, "DB_RENDER_CONTROL depth copy, resummarize or decompress");
 }
 
+bool MixedSampleApproximationEnabled() {
+    const char* value = std::getenv("APS5_APPROXIMATE_MIXED_SAMPLES");
+    if (value == nullptr || *value == 0 || std::string_view(value) == "0") return false;
+    Require(std::string_view(value) == "1", "APS5_APPROXIMATE_MIXED_SAMPLES must be 0 or 1");
+    return true;
+}
+
+bool AlphaWithoutColorEnabled() {
+    const auto* value = std::getenv("APS5_ALPHA_WITHOUT_COLOR");
+    return value != nullptr && std::string_view(value) == "1";
+}
+
+void ApplyMixedSampleApproximation(State& state) {
+    Require(state.depth && state.depth->samples == 1 && state.samples == 4, "mixed-sample approximation only supports one depth sample and four raster samples");
+    state.requestedSamples = state.samples;
+    if (!state.boundDepth) state.boundDepth = state.depth;
+    if (std::all_of(state.colors.begin(), state.colors.end(), [](const ColorTarget& color) { return color.samples == 1; })) {
+        state.samples = 1;
+        state.sampleLocations.fill(0);
+        state.customSampleLocations = false;
+        state.mixedSampleApproximation = MixedSampleApproximation::SingleSample;
+    } else if (!state.colors.empty() && std::all_of(state.colors.begin(), state.colors.end(), [](const ColorTarget& color) { return color.samples == 4; })) {
+        state.depth.reset();
+        state.depthTest = state.depthWrite = state.depthBoundsTest = state.depthBias = state.depthBiasPerFace = state.stencilTest = false;
+        state.stencilFront = state.stencilBack = {};
+        state.mixedSampleApproximation = MixedSampleApproximation::WithoutDepth;
+    } else {
+        std::ostringstream detail;
+        detail << "AGC graphics: mixed-sample approximation requires uniformly one-sample or four-sample color targets (depth 1, rasterizer 4, color samples";
+        for (const auto& color : state.colors) detail << ' ' << color.samples;
+        throw std::runtime_error(detail.str() + ')');
+    }
+    static std::atomic<unsigned> reports{0};
+    if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[mixed-samples] EXPERIMENTAL: %s; requested raster samples 4, effective %u; depth/stencil writes %s\n", state.mixedSampleApproximation == MixedSampleApproximation::SingleSample ? "single-sample rasterization" : "depth/stencil attachment omitted", state.samples, state.mixedSampleApproximation == MixedSampleApproximation::WithoutDepth ? "skipped" : "retained");
+}
+
 State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     if (auto reason = DepthMaintenanceRejection(queue); !reason.empty()) throw std::runtime_error(reason);
     const auto& cx = queue.context;
@@ -711,6 +778,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     Require(std::popcount(read(cx, 0x207) & 0xffffu) <= 8, "more than eight clip and cull distances are unsupported");
     result.paClVsOutCntl = read(cx, 0x207);
     result.samples = decodeSamples(cx);
+    result.requestedSamples = result.samples;
     Require(coveredCentroidSupported(queue), "COVERED_CENTROID_IS_CENTER with active or unspecified centroid inputs is not implemented");
     decodeSampleLocations(cx, result);
     {
@@ -750,10 +818,13 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     zero(cx, 0x203, shaderControlMask(read(cx, 0x1c4)), "depth export, shader coverage or ordered fragment execution");
     result.alphaToCoverage = read(cx, 0x2dc) == AlphaToCoverageUndithered;
     if (!result.alphaToCoverage) zero(cx, 0x2dc, AlphaToCoverageMask, "dithered or rounded alpha-to-coverage");
+    bool approximateMixedSamples = false;
     if (result.depth && result.depth->samples != result.samples) {
+        captureMixedSamples(queue);
         char detail[192];
         std::snprintf(detail, sizeof(detail), "the depth target's sample count differs from the rasterizer's (depth %u, rasterizer %u, AA_CONFIG 0x%08x, SC_MODE_CNTL_0 0x%08x)", result.depth->samples, result.samples, read(cx, 0x2f8), read(cx, 0x292));
-        Require(false, detail);
+        approximateMixedSamples = MixedSampleApproximationEnabled() && result.depth->samples == 1 && result.samples == 4;
+        Require(approximateMixedSamples, detail);
     }
     zero(cx, 0x292, ScanModeMask & ~1u, "scan conversion mode");
     Require(result.samples == 1 || (read(cx, 0x292) & 1u) != 0, "multisampled targets rasterized without MSAA_ENABLE are unsupported");
@@ -807,7 +878,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     // CB_COLOR_CONTROL mode 0 disables color writes, which only matters when a target is written.
     if (const auto colorControl = read(cx, 0x202); !colorControlSupported(colorControl, result.hasColorTarget)) throw std::runtime_error(colorControlMessage(colorControl));
     zero(cx, 0x1c4, zFormatSupported(read(cx, 0x1c4)) ? 0u : ~0u, "depth or sample-mask export");
-    const auto exportFormat = result.hasColorTarget ? read(cx, 0x1c5) : 0u;
+    const auto exportFormat = result.hasColorTarget || result.alphaToCoverage ? read(cx, 0x1c5) : 0u;
     APS5_LOG_OUT_DEBUG("Export format=%u", exportFormat);
     // SPI_SHADER_POS_FORMAT: POS0 must be a 4-component position; later vectors carry the misc/clip
     // exports that PA_CL_VS_OUT_CNTL validation above already limits to ignored layer/viewport data.
@@ -827,7 +898,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
             result.customSampleLocations = true;
             result.sampleLocations.fill(0);
         }
-        Require(color.samples == result.samples, "a color target's sample count differs from the rasterizer's");
+        Require(approximateMixedSamples || color.samples == result.samples, "a color target's sample count differs from the rasterizer's");
         APS5_LOG_OUT_DEBUG("Color %u address=0x%llx extent=%ux%u bytes=%llu VkFormat=%u", slot, static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<unsigned long long>(color.bytes), static_cast<unsigned>(color.format));
         if (result.colors.empty()) {
             result.renderExtent = color.extent;
@@ -836,6 +907,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         }
         result.colors.push_back(color);
     }
+    if (approximateMixedSamples) ApplyMixedSampleApproximation(result);
     if (result.hasColorTarget) {
         result.color = result.colors.front();
         result.renderLayers = result.color.layers;
@@ -972,10 +1044,16 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     }
     if (result.alphaToCoverage) {
         const auto mrt0 = std::find_if(result.colors.begin(), result.colors.end(), [](const ColorTarget& color) { return color.exportIndex == 0; });
-        Require(mrt0 != result.colors.end(), "alpha-to-coverage without a written MRT0 color target is unsupported");
+        if (mrt0 == result.colors.end()) {
+            captureMixedSamples(queue, "alpha-coverage");
+            Require(AlphaWithoutColorEnabled() && result.colors.empty() && result.depth && (result.samples == 1 || result.samples == 4), "alpha-to-coverage without a written MRT0 color target is unsupported");
+            result.alphaWithoutColor = true;
+            static std::atomic<bool> announced{false};
+            if (!announced.exchange(true)) std::fprintf(stderr, "[alpha-coverage] EXPERIMENTAL: depth-only alpha export drives the shader's binary coverage mask; depth writes retained\n");
+        }
         const auto format = exportFormat & 0xfu;
         Require(format == 4u || format == 5u || format == 6u || format == 9u, "alpha-to-coverage needs an MRT0 export format with a floating-point alpha");
-        Require(mrt0->componentMapping == 0xe4u && mrt0->packing == ShaderRecompiler::ColorExportPacking::None, "alpha-to-coverage into a component-swapped or packed MRT0 target is unsupported");
+        Require(result.alphaWithoutColor || (mrt0->componentMapping == 0xe4u && mrt0->packing == ShaderRecompiler::ColorExportPacking::None), "alpha-to-coverage into a component-swapped or packed MRT0 target is unsupported");
     }
     APS5_LOG_OUT_DEBUG("DecodeState done colorTarget=%u render=%ux%u topology=%u", result.hasColorTarget ? 1u : 0u, result.renderExtent.width, result.renderExtent.height, static_cast<unsigned>(result.topology));
     return result;

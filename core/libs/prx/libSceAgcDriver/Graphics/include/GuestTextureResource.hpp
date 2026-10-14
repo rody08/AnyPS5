@@ -87,11 +87,13 @@ struct GuestTextureResource {
     std::uint32_t minLod = 0;
     std::uint32_t allocatedMipCount = 0;
     std::uint32_t samples = 1;
+    bool approximatedTerminalMip = false;
 };
 
 float EffectiveMinLod(const GuestTextureResource& resource);
 
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words);
+bool TerminalMipApproximationEnabled();
 bool DescriptorSingleLevel(std::span<const std::uint32_t> words);
 bool MatchesGuestDimension(ShaderRecompiler::DescriptorImageShape shape, TextureDimension dimension, std::uint32_t samples = 1);
 

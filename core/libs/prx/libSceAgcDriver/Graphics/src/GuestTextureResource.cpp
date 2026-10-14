@@ -4,10 +4,18 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace AgcDriver::Graphics {
+
+bool TerminalMipApproximationEnabled() {
+    const auto* value = std::getenv("APS5_APPROXIMATE_TERMINAL_MIPS");
+    return value != nullptr && std::string_view(value) == "1";
+}
 
 namespace {
 
@@ -217,8 +225,19 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
     result.dccPipeAligned = metaPipeAligned;
     result.minLod = minLod;
     result.samples = samples;
+    if (baseLevel > maxMip && TerminalMipApproximationEnabled() && width == 1 && height == 1 && typeRaw == 13 && depth == 0 && baseArray == 0 && baseLevel == lastLevel && maxMip == 0 && minLod == 0 && !metaCompress && tileMode == TextureTileMode::kStandard256B && (format == 22 || format == 62 || format == 75)) {
+        result.baseLevel = result.lastLevel = 0;
+        result.approximatedTerminalMip = true;
+        static std::atomic<bool> announced{false};
+        if (!announced.exchange(true)) std::fprintf(stderr, "[terminal-mip] EXPERIMENTAL: 1x1 placeholder at 0x%llx maps requested mip %u to its existing texel; original T# retained (%08x %08x %08x %08x %08x %08x %08x %08x)\n", static_cast<unsigned long long>(baseAddress), baseLevel, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+        return result;
+    }
     if (baseLevel > maxMip) {
-        Require(LevelsFitAllocation(result, lastLevel + 1u), "guest texture descriptor starts past the surface's last mip level at levels that would move the surface's own" + describe());
+        if (!LevelsFitAllocation(result, lastLevel + 1u)) {
+            char captured[320];
+            std::snprintf(captured, sizeof(captured), " (address 0x%llx, T# %08x %08x %08x %08x %08x %08x %08x %08x)", static_cast<unsigned long long>(baseAddress), words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+            Require(false, "guest texture descriptor starts past the surface's last mip level at levels that would move the surface's own" + describe() + captured);
+        }
         result.mipCount = lastLevel + 1u;
     }
     return result;

@@ -31,7 +31,17 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     stageCapture.pushOffset = pushOffset;
     const auto capture = [&] {
         const SampledReadScope sampling(evidenceReads);
-        return shaderMemory.Capture(invocation);
+        try {
+            return shaderMemory.Capture(invocation);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[gpu] draw stage capture failed at shader 0x%llx: %s\n", static_cast<unsigned long long>(program.binary.codeAddress), error.what());
+            if (std::getenv("APS5_DUMP_FAILED_SHADERS") != nullptr) {
+                memory = shaderMemory.Regions();
+                request.context.memory = memory;
+                std::fprintf(stderr, "[gpu] failed shader request: %s\n", dumpRequest(program.binary.codeAddress, request).c_str());
+            }
+            throw;
+        }
     }();
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
@@ -44,6 +54,7 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
         }
     }
     request.context.memory = memory;
+    if (graphics.alphaWithoutColor && program.binary.stage == Stage::Fragment && std::getenv("APS5_DUMP_FAILED_SHADERS") != nullptr) static_cast<void>(dumpRequest(program.binary.codeAddress, request));
     if (traceCapSync()) traceCapture("draw-capture", program.binary.codeAddress, submission.queue, memory, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     if (profile) {
         ++captures;
