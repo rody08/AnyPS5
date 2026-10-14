@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -16,6 +17,7 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -25,6 +27,12 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace AgcDriver {
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextFor(VulkanDevice& device) { return device.graphicsContext(); }
+};
+}
 
 namespace {
 
@@ -78,6 +86,11 @@ std::array<std::uint32_t, 11> LoadCode(std::uint32_t dim) {
 alignas(256) std::array<std::uint32_t, 11> Load2D = LoadCode(LoadDims[0]);
 alignas(256) std::array<std::uint32_t, 11> LoadCube = LoadCode(LoadDims[1]);
 alignas(256) std::array<std::uint32_t, 11> LoadArray = LoadCode(LoadDims[2]);
+alignas(256) std::array<std::uint32_t, 11> LoadMultisample = LoadCode(6u);
+alignas(256) std::array<std::uint32_t, 12> LoadMultisampleArray{
+    0x7e020280u, 0x7e040280u, 0x7e06020cu, 0xf0001138u, 0x00010300u, 0xbf8c3f70u,
+    0x34080082u, 0xe0701000u, 0x80000304u, 0xbf810000u, 0xbf810000u, 0xbf810000u
+};
 
 alignas(256) std::array<std::byte, 256 * 128 * 4> Pixels{};
 
@@ -133,6 +146,8 @@ struct Shape {
     std::uint32_t lastArray;
     std::uint32_t swizzle;
     std::uint32_t baseArray = 0;
+    std::uint32_t samples = 1;
+    std::uint64_t metadataAddress = 0;
 };
 
 std::array<std::uint32_t, 8> TextureDescriptor(const void* data, const Shape& shape) {
@@ -141,9 +156,11 @@ std::array<std::uint32_t, 8> TextureDescriptor(const void* data, const Shape& sh
         static_cast<std::uint32_t>(address >> 8u),
         static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (shape.format << 20u) | (((shape.width - 1u) & 3u) << 30u),
         ((shape.width - 1u) >> 2u) | ((shape.height - 1u) << 14u),
-        0xfacu | (shape.swizzle << 20u) | (shape.type << 28u),
+        0xfacu | (shape.swizzle << 20u) | (shape.type << 28u) | (std::countr_zero(shape.samples) << 16u),
         shape.lastArray | (shape.baseArray << 16u),
-        0u, 0u, 0u,
+        static_cast<std::uint32_t>(std::countr_zero(shape.samples)) << 4u,
+        (shape.samples > 1 ? 1u << 10u : 0u) | (shape.metadataAddress != 0 ? 1u << 21u : 0u) | (static_cast<std::uint32_t>((shape.metadataAddress >> 8u) & 0xffu) << 24u),
+        static_cast<std::uint32_t>(shape.metadataAddress >> 16u),
     };
 }
 
@@ -155,7 +172,7 @@ std::uint32_t Bits(float value) {
 
 // Draws a full-target triangle at depth `z` into the depth surface at `address`, which makes the driver create the
 // surface (the base slice a later plane copy reads from the surface instead of from guest memory).
-void DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2D extent, VkFormat format, float z) {
+void DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2D extent, VkFormat format, float z, std::uint32_t samples = 1) {
     static std::deque<std::vector<std::array<float, 4>>> vertexData;
     vertexData.push_back({{-1.0f, -1.0f, z, 1.0f}, {3.0f, -1.0f, z, 1.0f}, {-1.0f, 3.0f, z, 1.0f}});
     const auto& vertices = vertexData.back();
@@ -200,6 +217,12 @@ void DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2
     state.colors = {state.color};
     state.hasColorTarget = true;
     state.depth = AgcDriver::Graphics::DepthTarget{address, 0, extent, format, 1.0f, 0};
+    state.samples = samples;
+    state.depth->samples = samples;
+    if (samples > 1) {
+        state.hasColorTarget = false;
+        state.colors.clear();
+    }
     state.depthTest = true;
     state.depthWrite = true;
     state.depthCompare = VK_COMPARE_OP_ALWAYS;
@@ -212,6 +235,7 @@ void DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2
     state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
+    if (samples > 1) state.blends.clear();
     state.blendConstants = {};
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(vertices.size()), 0, 1, 0, false};
     device.Draw(state, draw, shaders);
@@ -221,7 +245,7 @@ void DrawDepth(AgcDriver::VulkanDevice& device, std::uint64_t address, VkExtent2
 // Loads row 0 of `slice` of the texture `shape` describes at `texels` into `output` (one dword per thread). With
 // `shaderImage2D` the shader declares a 2D image whatever the T#'s type is.
 void Load(AgcDriver::VulkanDevice& device, std::uint8_t* texels, const Shape& shape, std::uint32_t slice, std::span<std::uint32_t> output, bool shaderImage2D = false) {
-    const auto& code = shaderImage2D ? Load2D : shape.type == TypeCube ? LoadCube : shape.type == Type2DArray ? LoadArray : Load2D;
+    const std::span<const std::uint32_t> code = shape.samples > 1 && shape.type == 15u && !shaderImage2D ? std::span<const std::uint32_t>(LoadMultisampleArray) : std::span<const std::uint32_t>(shape.samples > 1 ? LoadMultisample : shaderImage2D ? Load2D : shape.type == TypeCube ? LoadCube : shape.type == Type2DArray ? LoadArray : Load2D);
     std::vector<std::uint32_t> userData(16, 0u);
     const auto out = std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(output.data())), static_cast<std::uint32_t>((reinterpret_cast<std::uintptr_t>(output.data()) >> 32u) & 0xffffu), static_cast<std::uint32_t>(output.size_bytes()), 0x31016facu};
     const auto texture = TextureDescriptor(texels, shape);
@@ -317,6 +341,59 @@ void FirstSliceCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::spa
 }
 
 // A plane array from a later base slice is still refused (its slice offsets are not modeled here).
+void MultisampleCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    auto* base = block.At(0x100000);
+    DrawDepth(device, reinterpret_cast<std::uintptr_t>(base), {128, 128}, VK_FORMAT_D32_SFLOAT, 0.375f, 4u);
+    for (const auto type : {14u, 15u}) {
+        Shape shape{Format32Float, 128, 128, type, 0, Swizzle64KbZX};
+        shape.samples = 4u;
+        for (std::uint32_t sample = 0; sample < shape.samples; ++sample) {
+            Load(device, base, shape, sample, output);
+            Expect(output, Bits(0.375f), "D32 multisample depth sample " + std::to_string(sample));
+        }
+        if (type == 15u) {
+            Load(device, base, shape, 3u, output, true);
+            Expect(output, Bits(0.375f), "D32 multisample array first layer through a 2D shader");
+        }
+    }
+    Shape mismatch{Format32Float, 128, 128, 14u, 0, Swizzle64KbZX};
+    mismatch.samples = 2u;
+    bool refused = false;
+    try { Load(device, base, mismatch, 0, output); }
+    catch (const std::runtime_error& error) { refused = std::string(error.what()).find("sample count disagrees") != std::string::npos; }
+    Require(refused, "a multisample depth view with a different sample count was accepted");
+}
+
+void FastClearedMultisampleCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextFor(device);
+    auto* base = block.At(0x170000);
+    auto* metadata = block.At(0x180000);
+    AgcDriver::Graphics::DepthTarget target{reinterpret_cast<std::uintptr_t>(base), reinterpret_cast<std::uintptr_t>(block.At(0x160000)), {128, 128}, VK_FORMAT_D32_SFLOAT_S8_UINT, 0.625f, 0, reinterpret_cast<std::uintptr_t>(metadata), true, 4};
+    FillSlice(metadata, AgcDriver::Graphics::HtileMetadataBytes(target.extent), 0xfffffff0u, 4u);
+    Shape shape{Format32Float, 128, 128, 14u, 0, Swizzle64KbZX};
+    shape.samples = 4;
+    shape.metadataAddress = target.htileAddress;
+    AgcDriver::Graphics::RememberBoundDepthSurface(context.device, target);
+    for (std::uint32_t sample = 0; sample < shape.samples; ++sample) {
+        Load(device, base, shape, sample, output);
+        Expect(output, Bits(target.clearDepth), "undrawn fast-cleared multisample depth");
+    }
+    target.clearDepth = 0.875f;
+    bool stencilRefused = false;
+    try { AgcDriver::Graphics::DepthSurfaceView(context, target); }
+    catch (const std::runtime_error& error) { stencilRefused = std::string(error.what()).find("stencil plane") != std::string::npos; }
+    Require(stencilRefused, "an undefined stencil plane was accepted after initializing only fast-cleared depth");
+    AgcDriver::Graphics::RememberBoundDepthSurface(context.device, target);
+    Load(device, base, shape, 3, output);
+    Expect(output, Bits(target.clearDepth), "updated bound multisample depth clear value");
+    const std::uint32_t uncompressed = 0xffffffffu;
+    std::memcpy(metadata + 1024, &uncompressed, sizeof(uncompressed));
+    bool refused = false;
+    try { Load(device, base, shape, 0, output); }
+    catch (const std::runtime_error& error) { refused = std::string(error.what()).find("not fast-cleared") != std::string::npos; }
+    Require(refused, "partly uncompressed undrawn multisample depth was accepted");
+}
+
 void RefusalCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
     bool refused = false;
     try {
@@ -344,6 +421,8 @@ int main() {
         DepthBitsArrayCase(*device, block, output);
         FirstSliceCase(*device, block, output);
         RefusalCase(*device, block, output);
+        MultisampleCase(*device, block, output);
+        FastClearedMultisampleCase(*device, block, output);
         std::puts("depth plane sampling tests passed");
         return 0;
     } catch (const std::exception& error) {

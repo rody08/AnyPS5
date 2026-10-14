@@ -557,6 +557,12 @@ struct AudioOutOutputParam {
     const void* ptr;
 };
 
+struct AudioOutSystemState {
+    float loudness;
+    std::uint32_t reserved32;
+    std::uint64_t reserved64[3];
+};
+
 struct AudioOutPortState {
     std::uint16_t output;
     std::uint8_t channel;

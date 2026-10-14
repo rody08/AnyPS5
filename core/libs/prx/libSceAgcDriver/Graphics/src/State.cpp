@@ -737,11 +737,24 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         }
         Require((depthControl & 8u) == 0 || result.depth.has_value() || depthPlanesAbsent(cx), "depth bounds without a depth surface");
         Require((depthControl & 0xc0000000u) == 0, "depth-conditional color writes are unsupported");
+        const auto zInfo = find(cx, 0x010);
+        if (zInfo != cx.end() && (zInfo->second & 3u) != 0 && (zInfo->second & 3u) != 2u && (zInfo->second & 0xcu) != 0 && (zInfo->second & 0x20000000u) != 0 && depthSurfaceBound(cx)) {
+            if (result.depth) result.boundDepth = result.depth;
+            else {
+                State bound{};
+                decodeDepth(cx, depthControl & ~0xbu, false, bound);
+                result.boundDepth = bound.depth;
+            }
+        }
     }
     zero(cx, 0x203, shaderControlMask(read(cx, 0x1c4)), "depth export, shader coverage or ordered fragment execution");
     result.alphaToCoverage = read(cx, 0x2dc) == AlphaToCoverageUndithered;
     if (!result.alphaToCoverage) zero(cx, 0x2dc, AlphaToCoverageMask, "dithered or rounded alpha-to-coverage");
-    Require(!result.depth || result.depth->samples == result.samples, "the depth target's sample count differs from the rasterizer's");
+    if (result.depth && result.depth->samples != result.samples) {
+        char detail[192];
+        std::snprintf(detail, sizeof(detail), "the depth target's sample count differs from the rasterizer's (depth %u, rasterizer %u, AA_CONFIG 0x%08x, SC_MODE_CNTL_0 0x%08x)", result.depth->samples, result.samples, read(cx, 0x2f8), read(cx, 0x292));
+        Require(false, detail);
+    }
     zero(cx, 0x292, ScanModeMask & ~1u, "scan conversion mode");
     Require(result.samples == 1 || (read(cx, 0x292) & 1u) != 0, "multisampled targets rasterized without MSAA_ENABLE are unsupported");
     if (result.samples == 1 && (read(cx, 0x292) & 1u) != 0) {

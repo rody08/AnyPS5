@@ -103,6 +103,7 @@ static std::mutex g_mutex;
 static std::mutex g_outputMutex;
 static Port g_ports[PORTS_MAX];
 static bool g_sdlInitialized = false;
+static bool g_libraryInitialized = false;
 
 static bool ensureSdlAudio() {
     if (g_sdlInitialized) {
@@ -299,6 +300,20 @@ static Port* getPort(int handle) {
 extern "C" {
 
 int APS5_VABI sceAudioOutInit() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_libraryInitialized = true;
+    return 0;
+}
+
+int APS5_VABI sceAudioOutGetSystemState(AudioOutSystemState* state) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (!g_libraryInitialized && !g_sdlInitialized) return static_cast<int>(0x8026000F);
+    if (state == nullptr) return static_cast<int>(0x80260004);
+    for (const auto& port : g_ports) {
+        if (port.used && port.device != 0 && SDL_GetQueuedAudioSize(port.device) != 0)
+            throw std::runtime_error("sceAudioOutGetSystemState: live output loudness measurement is not implemented");
+    }
+    *state = {};
     return 0;
 }
 

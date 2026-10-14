@@ -17,6 +17,17 @@ target_link_libraries(libSceAudioOut PRIVATE libc libkernel SDL2-static)
 configure_windows_unwind(libSceAudioOut)
 
 if(BUILD_TESTING)
+    add_test_executable(audio_out_system_state_tests tests/AudioOutSystemState.cpp)
+    target_include_directories(audio_out_system_state_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(audio_out_system_state_tests PRIVATE libSceAudioOut libc)
+    configure_windows_unwind(audio_out_system_state_tests)
+    add_test(NAME audio_out_system_state COMMAND audio_out_system_state_tests)
+    set_tests_properties(audio_out_system_state PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(audio_out_system_state PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAudioOut>")
+    endif()
+
     add_test_executable(audio_out2_pad_mix_tests tests/AudioOut2PadMix.cpp src/AudioOut2PadMix.cpp)
     target_include_directories(audio_out2_pad_mix_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(audio_out2_pad_mix_tests PRIVATE libc)

@@ -38,7 +38,7 @@ public:
 
         std::vector<NidReference> result;
         for (const auto& ref : nidRefs)
-            if (index->IsGotSlotAccessed(ref.RelocationAddress))
+            if (ref.RelocationTypeValue == 1 || index->IsGotSlotAccessed(ref.RelocationAddress))
                 result.push_back(ref);
         return result;
     }

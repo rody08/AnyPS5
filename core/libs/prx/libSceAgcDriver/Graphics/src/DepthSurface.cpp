@@ -50,7 +50,7 @@ public:
             info.arrayLayers = 1;
             info.samples = static_cast<VkSampleCountFlagBits>(target.samples);
             info.tiling = VK_IMAGE_TILING_OPTIMAL;
-            info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (target.samples == 1 ? VK_IMAGE_USAGE_SAMPLED_BIT : 0u);
+            info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
             info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
             info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &info, nullptr, &image), "vkCreateImage depth");
@@ -116,6 +116,8 @@ public:
     }
 
     std::shared_ptr<Texture> Sampled(std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
+        const bool stencil = target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
+        Require(!stencil || stencilDefined, "sampling an undrawn multisampled stencil plane is not implemented");
         std::array<std::uint32_t, 12> key{};
         std::copy_n(words.begin(), std::min<std::size_t>(words.size(), 8), key.begin());
         key[8] = components.r;
@@ -123,8 +125,7 @@ public:
         key[10] = components.b;
         key[11] = components.a;
         if (const auto found = textures.find(key); found != textures.end()) return found->second;
-        Require(target.samples == 1, "sampling a multisampled depth surface is not implemented");
-        const bool stencil = target.stencilAddress != 0 && resource.baseAddress == target.stencilAddress;
+        Require(target.samples == resource.samples, "sampled depth surface sample count disagrees with its descriptor");
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
         const auto expected = stencil ? VK_FORMAT_R8_UINT : d16 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R32_SFLOAT;
         const auto format = ResolveTextureFormat(resource.format);
@@ -148,6 +149,8 @@ public:
     }
 
     std::uint64_t written = ++depthWrites;
+    bool metadataOnly = false;
+    bool stencilDefined = true;
 
     VkImageAspectFlags pendingClear = 0;
     float clearDepth = 0.0f;
@@ -458,6 +461,19 @@ std::set<std::uint64_t>& clearedHtiles() {
     return *cleared;
 }
 
+std::map<std::pair<VkDevice, std::uint64_t>, DepthTarget>& boundDepthTargets() {
+    static auto* targets = new std::map<std::pair<VkDevice, std::uint64_t>, DepthTarget>();
+    return *targets;
+}
+
+bool DepthMetadataCleared(const DepthTarget& target, VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT) {
+    if (target.htileAddress == 0 || ((aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0 && !target.htileStencil)) return false;
+    std::vector<std::uint32_t> metadata(HtileMetadataBytes(target.extent) / sizeof(std::uint32_t));
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), metadata.size() * sizeof(std::uint32_t))) return false;
+    GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(metadata)));
+    return std::ranges::all_of(metadata, [&](std::uint32_t word) { return (HtileFillClears(word, target.htileStencil) & aspects) == aspects; });
+}
+
 const DepthSurface* drawnDepth = nullptr;
 
 }
@@ -506,16 +522,27 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
     return constant * 256.0f;
 }
 
-VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
+VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool stencilUse) {
+    bool needsStencil = false;
+    if (stencilUse && target.stencilAddress != 0) {
+        std::lock_guard lock(surfacesMutex());
+        needsStencil = std::ranges::any_of(surfaces(), [&](const auto& surface) { return surface->context.device == context.device && sameSurface(surface->target, target) && !surface->stencilDefined; });
+    }
+    if (needsStencil) Require(DepthMetadataCleared(target, VK_IMAGE_ASPECT_STENCIL_BIT), "drawing with an undrawn multisampled stencil plane that is not fast-cleared is not implemented");
     std::lock_guard lock(surfacesMutex());
     const bool cleared = target.htileAddress != 0 && clearedHtiles().erase(target.htileAddress) != 0;
     for (const auto& surface : surfaces()) {
         if (surface->context.device != context.device || !sameSurface(surface->target, target)) continue;
         surface->clearDepth = target.clearDepth;
         surface->clearStencil = target.clearStencil;
+        if (needsStencil) {
+            surface->stencilDefined = true;
+            surface->pendingClear |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        }
         if (cleared) surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
         surface->ApplyFastClear();
         surface->written = ++depthWrites;
+        surface->metadataOnly = false;
         drawnDepth = surface.get();
         return surface->view;
     }
@@ -524,6 +551,23 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     surfaces().back()->clearStencil = target.clearStencil;
     drawnDepth = surfaces().back().get();
     return surfaces().back()->view;
+}
+
+void RememberBoundDepthSurface(VkDevice device, const DepthTarget& target) {
+    if (target.samples <= 1 || target.htileAddress == 0) return;
+    std::lock_guard lock(surfacesMutex());
+    boundDepthTargets()[{device, target.address}] = target;
+    for (const auto& surface : surfaces()) {
+        if (surface->context.device != device || !sameSurface(surface->target, target) || !surface->metadataOnly) continue;
+        if (surface->clearDepth != target.clearDepth) {
+            surface->clearDepth = target.clearDepth;
+            surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
+        }
+        if (surface->clearStencil != target.clearStencil) {
+            surface->clearStencil = target.clearStencil;
+            if (surface->stencilDefined) surface->pendingClear |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        }
+    }
 }
 
 std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads) {
@@ -575,16 +619,44 @@ void ClearDepthSurfaces(VkDevice device) {
     drawnDepth = nullptr;
     std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });
     std::erase_if(planeCopies(), [&](const auto& entry) { return std::get<0>(entry.first) == device; });
+    std::erase_if(boundDepthTargets(), [&](const auto& entry) { return entry.first.first == device; });
 }
 
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
     const auto held = [&](const auto& surface) {
         return surface->context.device == context.device && (surface->target.address == resource.baseAddress || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress));
     };
+    bool present = false;
+    std::optional<DepthTarget> metadataTarget;
     {
         std::lock_guard lock(surfacesMutex());
-        if (std::none_of(surfaces().begin(), surfaces().end(), held)) return nullptr;
+        present = std::any_of(surfaces().begin(), surfaces().end(), held);
+        if (const auto known = boundDepthTargets().find({context.device, resource.baseAddress}); resource.samples > 1 && known != boundDepthTargets().end()) {
+            const auto& target = known->second;
+            if (target.samples == resource.samples && target.extent.width == resource.width && target.extent.height == resource.height && resource.baseArray == 0 && resource.depthOrLastArray == 0 && resource.dccAddress == target.htileAddress) {
+                const bool seeded = !present || std::ranges::any_of(surfaces(), [&](const auto& surface) { return held(surface) && surface->metadataOnly; });
+                if (seeded) metadataTarget = target;
+            }
+        }
     }
+    if (metadataTarget) {
+        Require(DepthMetadataCleared(*metadataTarget), "multisampled depth without rendered content has HTILE blocks that are not fast-cleared");
+        if (!present) {
+            const bool stencilDefined = metadataTarget->stencilAddress == 0 || DepthMetadataCleared(*metadataTarget, VK_IMAGE_ASPECT_STENCIL_BIT);
+            std::lock_guard gpu(GuestMemory::GpuMutex());
+            std::lock_guard lock(surfacesMutex());
+            if (std::none_of(surfaces().begin(), surfaces().end(), held)) {
+                auto surface = std::make_unique<DepthSurface>(context, *metadataTarget);
+                surface->metadataOnly = true;
+                surface->stencilDefined = stencilDefined;
+                surface->clearDepth = metadataTarget->clearDepth;
+                surfaces().push_back(std::move(surface));
+                std::fprintf(stderr, "[ms-depth] initialized fast-cleared surface 0x%llx (%ux%u, %u samples, clear %.9g) from bound depth state\n", static_cast<unsigned long long>(metadataTarget->address), metadataTarget->extent.width, metadataTarget->extent.height, metadataTarget->samples, metadataTarget->clearDepth);
+            }
+            present = true;
+        }
+    }
+    if (!present) return nullptr;
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
     const auto& list = surfaces();
@@ -637,7 +709,7 @@ bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resou
     const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) {
         return surface->context.device == context.device && (surface->target.address == address || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == address));
     });
-    return found != list.rend() && (*found)->Holds(texture);
+    return found != list.rend() && !(*found)->metadataOnly && (*found)->target.samples == resource.samples && (*found)->Holds(texture);
 }
 
 VkImageAspectFlags HtileFillClears(std::uint32_t pattern, bool stencilInHtile) {

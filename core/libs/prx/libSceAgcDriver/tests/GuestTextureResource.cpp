@@ -316,6 +316,13 @@ void RunGuestTextureResourceTests() {
     Fields badMsaa = base;
     badMsaa.msaaDepth = true;
     rejectFields(badMsaa, "MSAA");
+    const std::array<std::uint32_t, 8> mlbDepth{0x14a27100u, 0xc1600000u, 0x021bc3bfu, 0xe1820204u, 0u, 0x00700020u, 0x00280400u, 0x0014a267u};
+    const auto multisample = DecodeTextureResource(mlbDepth);
+    Require(multisample.samples == 4 && multisample.mipCount == 1 && multisample.lastLevel == 0 && multisample.width == 3840 && multisample.height == 2160, "multisample LAST_LEVEL must describe samples rather than mip levels");
+    Require(MatchesGuestDimension(Shape::Image2DMultisample, multisample.dimension, multisample.samples), "multisample shape must match a multisampled descriptor");
+    Require(!MatchesGuestDimension(Shape::Image2D, multisample.dimension, multisample.samples), "single-sample shape must reject multisampled descriptors");
+    Require(!MatchesGuestDimension(Shape::Image2DMultisample, TextureDimension::k2D), "multisample shape must reject single-sample descriptors");
+    reject([&] { DescribeSurface(multisample); }, "guest-memory layout of multisampled textures");
 
     Fields blockSize = base;
     blockSize.maxUncompBlkSize = 1;

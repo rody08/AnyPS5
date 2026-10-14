@@ -121,7 +121,7 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
     binding.count = 3;
     binding.guestDescriptor = {0x11111111u * seed, 0xdeadbeefu, 0x80000000u, 7u, 0u, 0xffffffffu, 42u, seed};
     binding.readOnly = seed % 2 == 0;
-    binding.imageShape = DescriptorImageShape::Image2DArray;
+    binding.imageShape = seed == 1 ? DescriptorImageShape::Image2DMultisampleArray : DescriptorImageShape::Image2DMultisample;
     binding.samplerDepthCompare = {true, false, true};
     binding.imageDepthCompare = {false, true, false};
     binding.imageWritten = {false, true, true};
@@ -882,6 +882,33 @@ void verifyBindingPlanSelection() {
     rejectsAlignment("base is not aligned to its element");
 }
 
+void verifyNullMultisampleBindingPlans() {
+    for (const auto dimension : {RdnaImageDimension::Dim2DMsaa, RdnaImageDimension::Dim2DMsaaArray}) {
+        ShaderInfo info{};
+        ImageResource image{};
+        image.dimension = dimension;
+        image.resourceClass = ImageResourceClass::Sampled;
+        info.images = {image};
+        info.runtimeImageModes = {ResourceMaterializer::RuntimeImageModes(image)};
+        IrBindingLayout layout{};
+        for (const auto& mode : info.runtimeImageModes[0]) {
+            const auto kind = DescriptorBindingForImage(mode);
+            if (std::ranges::none_of(layout.descriptors, [&](const auto& binding) { return binding.kind == kind; })) layout.descriptors.push_back({kind, {0}});
+        }
+        ResourceSnapshot snapshot{};
+        snapshot.images.resize(1);
+        snapshot.images[0].dwordCount = 8u;
+        const DescriptorBindingBuilder builder;
+        const auto plan = builder.Prepare(layout, info, IrShaderStage::Compute, snapshot, {}, true);
+        require(plan.bindings.size() == layout.descriptors.size(), "registration plan lost a null multisample heap");
+        for (const auto& binding : plan.bindings) {
+            require(binding.descriptor.imageShape == DescriptorImageShape::Image2DMultisample || binding.descriptor.imageShape == DescriptorImageShape::Image2DMultisampleArray, "registration plan lost the multisample image shape");
+        }
+        const auto selected = builder.Select(plan, {});
+        require(selected.bindings.empty(), "module selection retained unused multisample heaps");
+    }
+}
+
 void verifyVertexTypeSpecialization() {
     CompiledShaderArtifact artifact;
     artifact.vertexInputs = {{0, 4, 0, 1}, {1, 4, 0, 1}};
@@ -1117,6 +1144,7 @@ int main(int argc, char** argv) {
         verifyInvocationIsolation();
         verifyBufferAlignmentSpecialization();
         verifyBindingPlanSelection();
+        verifyNullMultisampleBindingPlans();
         verifyVertexTypeSpecialization();
         verifyBuiltinSpecialization();
         verifySpecializationLiveness();

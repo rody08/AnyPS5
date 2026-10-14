@@ -198,7 +198,7 @@ public:
         const auto analysis = UnusedNidFilter::AnalyzeStrictReachability(input);
         std::vector<NidReference> result;
         for (const auto& reference : nidRefs) {
-            if (analysis.ImportSlots.contains(reference.RelocationAddress)) result.push_back(reference);
+            if (reference.RelocationTypeValue == 1 || analysis.ImportSlots.contains(reference.RelocationAddress)) result.push_back(reference);
         }
         { std::ostringstream message; message << "Strict reachability: " << analysis.Instructions.size() << " instructions; conservative indirect transfers=" << analysis.IndirectTransfers << "\n"; progress.Message(message.str()); }
         { std::ostringstream message; message << "Function graph: " << analysis.LiveRegions << "/" << analysis.TotalRegions << " live regions; address-taken roots=" << analysis.AddressTakenRoots << "; unwind functions=" << input.Functions.size() << "\n"; progress.Message(message.str()); }

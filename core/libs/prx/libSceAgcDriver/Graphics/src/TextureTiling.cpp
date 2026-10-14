@@ -381,6 +381,7 @@ ThickLayout ComputeThickLayout(TextureTileMode tileMode, std::uint32_t format, s
 }
 
 SurfaceGeometry DescribeSurface(const GuestTextureResource& descriptor) {
+    Require(descriptor.samples == 1, "guest-memory layout of multisampled textures is not implemented");
     SurfaceGeometry geometry;
     if (descriptor.dimension == TextureDimension::k3D && (descriptor.tileMode == TextureTileMode::kZ64KBX || descriptor.tileMode == TextureTileMode::kR64KBX)) {
         const auto depth = descriptor.depthOrLastArray + 1u;

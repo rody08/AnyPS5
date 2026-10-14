@@ -142,6 +142,19 @@ void hdrComponentSwapTests() {
 }
 
 void stateTests() {
+    auto boundQueue = makeState();
+    boundQueue.context[0x000] = 0;
+    boundQueue.context[0x002] = 0;
+    boundQueue.context[0x005] = 0x120000u;
+    boundQueue.context[0x007] = 127u | (127u << 16u);
+    boundQueue.context[0x00a] = 0;
+    boundQueue.context[0x00b] = std::bit_cast<std::uint32_t>(0.625f);
+    boundQueue.context[0x010] = 0x2000000bu;
+    boundQueue.context[0x011] = 0;
+    boundQueue.context[0x012] = boundQueue.context[0x014] = 0x123400u;
+    const auto boundState = AgcDriver::Graphics::DecodeState(boundQueue);
+    Require(!boundState.depth && !boundState.depthTest && boundState.boundDepth.has_value(), "disabled depth testing must preserve a bound multisample target without attaching it");
+    Require(boundState.boundDepth->address == 0x12340000u && boundState.boundDepth->samples == 4u && boundState.boundDepth->clearDepth == 0.625f && boundState.boundDepth->htileAddress == 0x12000000u, "bound multisample depth state lost the address, samples or clear value");
     AgcDriver::QueueState initial;
     Require(initial.context.at(0x200) == 0 && initial.context.at(0x83) == 0xffff, "initial context state is missing");
     initial.context[0x200] = 7;
